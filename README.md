@@ -1,4 +1,4 @@
-# Agent 5: Validator (Hongyi Quality Gate)
+# Agent 5: Validator
 
 An enterprise-grade validation agent designed for an "AI for Compliance" workflow. It leverages a Hybrid Architecture (Python Deterministic Engine + CrewAI Semantic Evaluator) to ensure uncompromising data accuracy and regulatory adherence.
 
