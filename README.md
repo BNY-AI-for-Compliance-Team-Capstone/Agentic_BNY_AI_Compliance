@@ -1,263 +1,98 @@
-# Agentic BNY AI Compliance
+# SAR Narrative Generator Agent
 
-Multi-agent compliance reporting system.
+A **CrewAI** agent that generates the mandatory narrative section for Suspicious Activity Reports (SAR) from structured JSON input. The agent is designed to **not hallucinate**: it uses only the provided input data and follows few-shot examples and effectiveness guidelines.
 
-## What This Project Does
+## Features
 
-This project accepts transaction data, determines the report type (SAR/CTR/Sanctions), gathers context from a knowledge base, generates a narrative, validates report quality/compliance, and produces a PDF report.
+- **Input:** JSON with case, subject, institution, alert, SuspiciousActivityInformation (FinCEN-style fields), and transactions.
+- **Output:** Same structure as input with one new field `narrative` added (input JSON + `{"narrative": "..."}`).
+- **CrewAI:** One agent (SAR Narrative Writer) with one task; uses OpenAI `gpt-4o-mini` (small model).
+- **Few-shot examples:** Built-in examples (input snippet → narrative) used in the agent prompt.
+- **Reference narratives:** Effectiveness guidelines and example explanations so the agent aligns with SAR best practices.
+- **Tests:** Pytest for schemas and agent (mocked so no API key needed for unit tests).
+- **Demo:** Jupyter notebook showing full flow from input JSON to generated narrative.
 
-## Architecture
-
-Core components:
-
-- API: FastAPI + CrewAI orchestration
-- PostgreSQL: durable relational data (`report_schemas`, `validation_rules`, `field_mappings`, `risk_indicators`, `job_status`, `audit_log`)
-- Weaviate: semantic retrieval for similar narratives and regulations
-- Redis: caching for schema/rules/mappings/indicators
-
-## Request Flow (End to End)
-
-1. `POST /api/v1/reports/submit` receives `transaction_data`.
-2. API creates a job record in Postgres (`pending`).
-3. Background task runs `create_compliance_crew(...)`.
-4. Router agent classifies report type and checks KB availability.
-5. If KB is missing data, Researcher agent fetches regulatory sources and updates KB.
-6. Aggregator + Narrative + Validator agents run sequentially.
-7. If approved, Filer agent generates PDF and stores output metadata.
-8. Job status/result is updated in Postgres.
-9. Client polls status and downloads PDF when ready.
-
-## API Endpoints
-
-Base router prefix: `/api/v1`
-
-- `POST /api/v1/reports/submit`
-- `GET /api/v1/reports/{job_id}/status`
-- `GET /api/v1/reports/{job_id}/download`
-- `GET /api/v1/kb/search`
-
-Health endpoint (outside router prefix):
-
-- `GET /health`
-
-## Agent Roles
-
-- Router: chooses report type and summarizes rationale
-- Researcher: finds official regulatory info and updates KB
-- Aggregator: maps raw transaction data to report schema and flags missing fields/risk indicators
-- Narrative: writes professional compliance narrative
-- Validator: checks technical completeness, compliance, and quality
-- Filer: produces final PDF report
-
-## Knowledge Base Design
-
-`KBManager` coordinates:
-
-- Postgres for structured compliance metadata
-- Weaviate for semantic retrieval
-- Redis cache to reduce repeated DB reads
-- OpenAI embeddings + fallback LLM narrative generation
-
-Weaviate collections:
-
-- `Narratives`
-- `Regulations`
-- `Definitions`
-
-## Configuration
-
-Runtime settings are loaded from environment variables (`backend/config/settings.py`).
-
-Key variables:
-
-- `DATABASE_URL`
-- `POSTGRES_DB`
-- `POSTGRES_USER`
-- `POSTGRES_PASSWORD`
-- `WEAVIATE_URL`
-- `WEAVIATE_API_KEY`
-- `REDIS_URL`
-- `OPENAI_API_KEY`
-- `GEMINI_API_KEY`
-
-## Local Run
-
-1. Create `.env` from template:
+## Setup
 
 ```bash
-cp .env.example .env
-```
-
-2. Create and activate a virtual environment:
-
-```bash
+cd narrative_agent
 python -m venv .venv
-source .venv/bin/activate
+source .venv/bin/activate   # or .venv\Scripts\activate on Windows
 pip install -r requirements.txt
 ```
 
-3. If you use Conda, deactivate it first so scripts use `.venv` packages:
+Set your OpenAI API key:
 
 ```bash
-conda deactivate
-source .venv/bin/activate
-which python
+export OPENAI_API_KEY=sk-...
+# or add OPENAI_API_KEY=sk-... to a .env file in the project root
 ```
 
-4. Configure environment variables in `.env`.
+## Running the agent
 
-- For Weaviate Cloud, use a full HTTPS URL and API key:
-  - `WEAVIATE_URL=https://<your-cluster>.weaviate.cloud`
-  - `WEAVIATE_API_KEY=<your-weaviate-api-key>`
-- For local Weaviate:
-  - `WEAVIATE_URL=http://localhost:8080`
-  - `WEAVIATE_API_KEY=` (empty for anonymous local mode)
-
-5. Ensure PostgreSQL, Redis, and Weaviate are reachable from `.env`.
-
-6. Run preflight checks (recommended for teammates):
+From the project root, with `src` on the Python path:
 
 ```bash
-python scripts/preflight.py
+cd narrative_agent
+PYTHONPATH=src python -c "
+from narrative_agent import generate_narrative
+import json
+with open('examples/input_example.json') as f:
+    data = json.load(f)
+out = generate_narrative(data)
+print(json.dumps(out, indent=2))
+"
 ```
 
-7. Initialize and seed the knowledge base:
+Or use the class:
+
+```python
+from narrative_agent import NarrativeGeneratorCrew
+crew = NarrativeGeneratorCrew(verbose=True)
+result = crew.kickoff(inputs=<your_sar_input_dict>)
+# result is {"narrative": "..."}
+```
+
+## Running tests
 
 ```bash
-python scripts/init_weaviate.py
-python scripts/seed_kb.py
+cd narrative_agent
+PYTHONPATH=src pytest tests/ -v
 ```
 
-8. Start the API from project root (use any free port):
+## Jupyter notebook demo
+
+From the project root:
 
 ```bash
-uvicorn backend.api.main:app --host 0.0.0.0 --port 8001 --reload
+cd narrative_agent
+PYTHONPATH=src jupyter notebook notebooks/sar_narrative_demo.ipynb
 ```
 
-9. Health check:
+Run all cells. The notebook loads the input example, shows few-shot examples and reference guidelines, runs the agent, and displays the generated narrative in JSON.
 
-```bash
-curl http://localhost:8001/health
+## Project structure
+
+```
+narrative_agent/
+  requirements.txt
+  README.md
+  examples/
+    input_example.json       # Example SAR input
+  src/
+    narrative_agent/
+      __init__.py
+      agent.py               # CrewAI agent, task, crew; generate_narrative()
+      schemas.py             # NarrativeOutput, validate_input/validate_output
+      examples.py            # Few-shot examples (input + narrative)
+      narrative_reference.py # Effectiveness guidelines and reference narratives
+  tests/
+    test_schemas.py
+    test_agent.py
+  notebooks/
+    sar_narrative_demo.ipynb
 ```
 
-Expected response:
+## License
 
-```json
-{"status":"healthy","services":{"postgres":true,"weaviate":true,"redis":true}}
-```
-
-10. Stop with `Ctrl+C`.
-
-## Team Onboarding Checklist
-
-Use this exact sequence on a new machine:
-
-```bash
-git clone <repo-url>
-cd Agentic_BNY_AI_Compliance
-cp .env.example .env
-python -m venv .venv
-source .venv/bin/activate
-pip install -r requirements.txt
-python scripts/preflight.py
-python scripts/init_weaviate.py
-python scripts/seed_kb.py
-uvicorn backend.api.main:app --host 0.0.0.0 --port 8001 --reload
-```
-
-If `python scripts/preflight.py` fails, fix those service/env issues first before running seed/API.
-
-## External Services
-
-The API depends on:
-
-- PostgreSQL (for report schemas, rules, jobs, audit data)
-- Weaviate (for vector search and retrieval)
-- Redis (for caching)
-
-The app can start even if some services are down, but feature behavior depends on them:
-
-- Postgres down: report job/state operations fail
-- Redis down: cache falls back to direct datastore reads
-- Weaviate down: semantic KB operations fail (search/add/regulatory retrieval)
-
-## Troubleshooting
-
-### 1) `password authentication failed for user "postgres"`
-
-Cause: something is using old Postgres credentials.
-
-Check:
-
-- `DATABASE_URL` in `.env`
-- any hardcoded DB URL usage
-
-Current `PostgreSQLClient` resolves DB URL from runtime settings, not hardcoded defaults.
-
-### 2) Weaviate `401 anonymous access not enabled`
-
-Cause: API key auth is enabled in Weaviate but client did not send key.
-
-Fix:
-
-- Ensure `WEAVIATE_API_KEY` is set in `.env`
-- Ensure `WEAVIATE_URL` points to your reachable Weaviate endpoint
-- Weaviate client must use API key auth
-
-### 3) Weaviate `MissingSchema: Invalid URL ... No scheme supplied`
-
-Cause: `WEAVIATE_URL` is missing `http://` or `https://`.
-
-Fix:
-
-- Cloud: `WEAVIATE_URL=https://<cluster>.weaviate.cloud`
-- Local: `WEAVIATE_URL=http://localhost:8080`
-
-### 4) `ModuleNotFoundError: No module named 'pkg_resources'`
-
-Cause: CrewAI dependency path requires `pkg_resources`; newer `setuptools` removed it.
-
-Fix:
-
-- Keep `setuptools<81` (already pinned in `requirements.txt`)
-- Reinstall in venv: `python -m pip install --force-reinstall "setuptools<81"`
-
-### 5) `Address already in use` when starting Uvicorn
-
-Cause: selected port is already bound by another process.
-
-Fix:
-
-- Use a free port (for example `8002`)
-- Or stop the existing listener:
-  - `kill -9 $(lsof -ti tcp:8001 -sTCP:LISTEN) 2>/dev/null || true`
-
-### 6) CrewAI `Function must have a docstring`
-
-Cause: `@tool` decorated functions without docstrings.
-
-Fix: add docstrings to all tool functions.
-
-### 7) Frequent health-check log noise
-
-`/health` performs real checks for Postgres/Weaviate/Redis. If any upstream dependency is misconfigured, failures will repeat on each health call until fixed.
-
-### 8) Warnings about Pydantic/Weaviate versions
-
-Current warnings are non-fatal. They are upgrade hygiene tasks, not runtime blockers.
-
-## Security Notes
-
-- Never commit real secrets.
-- `.gitignore` excludes `.env` files.
-- Rotate keys if they were ever exposed in logs/chat/screenshots.
-
-## GitHub Push (Quick)
-
-```bash
-git add .
-git commit -m "Initial commit"
-git branch -M main
-git remote add origin https://github.com/tursunait/Agentic_BNY_AI_Compliance.git
-git push -u origin main
-```
+Internal use / Capstone project.
