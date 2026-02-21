@@ -1,4 +1,4 @@
-# Agent 5: Validator - Hongyi (Quality Gate)
+# Agent 5: Validator
 
 This repository contains the **Validator Agent** implementation for the **AI for Compliance** Capstone project. Acting as the final **Quality Gate**, this agent ensures that generated Suspicious Activity Reports (SARs) meet strict regulatory standards before human review.
 
