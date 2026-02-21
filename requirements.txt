@@ -1,0 +1,4 @@
+crewai>=0.28.0
+langchain-google-genai>=1.0.3
+pydantic>=2.7.0
+python-dotenv>=1.0.0

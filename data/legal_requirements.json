@@ -1,0 +1,14 @@
+[
+  {
+    "req_id": "LEG-BSA-001",
+    "framework": "BSA (Bank Secrecy Act)",
+    "description": "Financial institutions must file a SAR for transactions aggregating $5,000 or more that involve potential money laundering or structuring.",
+    "evaluation_logic": "Verify that the narrative clearly justifies the suspicion of structuring (e.g., multiple transactions just below the $10,000 CTR threshold)."
+  },
+  {
+    "req_id": "LEG-AML-002",
+    "framework": "AML (Anti-Money Laundering)",
+    "description": "Any adverse media or law enforcement inquiries involving the subject must be highlighted in the assessment.",
+    "evaluation_logic": "If 'external_signals.adverse_media' exists, ensure the narrative explicitly mentions the media findings and how it impacts the risk."
+  }
+]

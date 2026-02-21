@@ -1,0 +1,29 @@
+[
+  {
+    "rule_id": "SAR-C001",
+    "report_type": "SAR",
+    "severity": "critical",
+    "rule_json": {
+      "condition": "subject.name IS NOT NULL OR subject.ssn IS NOT NULL",
+      "message": "Subject must have a name or an identifier."
+    }
+  },
+  {
+    "rule_id": "SAR-C002",
+    "report_type": "SAR",
+    "severity": "critical",
+    "rule_json": {
+      "condition": "SuspiciousActivityInformation.26_AmountInvolved.amount_usd > 0",
+      "message": "Transaction amount must be explicitly stated and greater than 0."
+    }
+  },
+  {
+    "rule_id": "SAR-C003",
+    "report_type": "SAR",
+    "severity": "high",
+    "rule_json": {
+      "condition": "alert.risk_score IS NOT NULL",
+      "message": "Alert risk score must be attached to the case."
+    }
+  }
+]
