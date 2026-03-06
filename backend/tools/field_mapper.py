@@ -91,14 +91,26 @@ class SARFieldMapper:
         le = self.signals.get("law_enforcement_contacted", {})
         self.le = le if isinstance(le, dict) else {}
 
-    def map_all_fields(self) -> Dict[str, str]:
+    def map_all_fields(self, template_variant: str = "legacy") -> Dict[str, str]:
         fields: Dict[str, str] = {}
-        fields.update(self._map_institution())
-        fields.update(self._map_suspect())
-        fields.update(self._map_suspicious_activity())
-        fields.update(self._map_law_enforcement())
-        fields.update(self._map_contact())
-        fields.update(self._map_narrative())
+        variant = (template_variant or "legacy").strip().lower()
+        if variant == "fincen_acroform":
+            fields.update(self._map_fincen_acroform())
+        elif variant == "all":
+            fields.update(self._map_institution())
+            fields.update(self._map_suspect())
+            fields.update(self._map_suspicious_activity())
+            fields.update(self._map_law_enforcement())
+            fields.update(self._map_contact())
+            fields.update(self._map_narrative())
+            fields.update(self._map_fincen_acroform())
+        else:
+            fields.update(self._map_institution())
+            fields.update(self._map_suspect())
+            fields.update(self._map_suspicious_activity())
+            fields.update(self._map_law_enforcement())
+            fields.update(self._map_contact())
+            fields.update(self._map_narrative())
         return {
             key: str(value)
             for key, value in fields.items()
@@ -109,12 +121,17 @@ class SARFieldMapper:
         f: Dict[str, str] = {}
 
         f["item2"] = self.inst.get("name", "")
-        f["item6"] = self.inst.get("branch_city", "")
+        fallback_city, fallback_state = self._city_state_from_txns()
+        city = (self.inst.get("branch_city", "") or "").strip() or fallback_city
+        state = ((self.inst.get("branch_state", "") or "").strip()[:2] or fallback_state)
+        zip_code = (
+            (self.inst.get("zip", "") or "").strip()
+            or (self.inst.get("postal_code", "") or "").strip()
+        )
 
-        state = (self.inst.get("branch_state", "") or "")[:2]
-        city = self.inst.get("branch_city", "") or ""
+        f["item6"] = city
         f["item7"] = state
-        f["item9"] = f"{city}, {state}".strip(", ")
+        f["item9"] = self._compose_address_line(city, state, zip_code)
         f["item10"] = city
         f["item11-1"] = state
 
@@ -149,8 +166,9 @@ class SARFieldMapper:
 
         full_name = self.subject.get("name", "") or ""
         subject_type = (self.subject.get("type", "") or "").lower()
+        treat_as_entity = subject_type != "individual" or self._looks_like_entity_name(full_name)
 
-        if subject_type == "individual":
+        if not treat_as_entity:
             parsed = self._split_individual_name(full_name)
             f["item15"] = parsed["last"]
             f["item16"] = parsed["first"]
@@ -186,9 +204,11 @@ class SARFieldMapper:
         self._apply_mmddyyyy(date_range.get("from", ""), ("item33-1", "item33-2", "item33-3"), f)
         self._apply_mmddyyyy(date_range.get("to", ""), ("item33-4", "item33-5", "item33-6"), f)
 
-        amount_info = self.activity.get("26_AmountInvolved", {})
-        amount_val = amount_info.get("amount_usd", 0.0) or 0.0
-        amount_digits = f"{int(float(amount_val)):011d}"
+        amount_val = self._resolve_amount_involved()
+        amount_digits = f"{int(round(amount_val)):011d}"
+        # Some SAR templates expose item34 as one text field, while others split
+        # it across 11 digit boxes (item34-1..item34-11). Populate both styles.
+        f["item34"] = str(int(round(amount_val)))
         for idx, field_id in enumerate(
             [
                 "item34-1",
@@ -206,21 +226,11 @@ class SARFieldMapper:
         ):
             f[field_id] = amount_digits[idx]
 
-        if self._has_items(self.activity.get("29_Structuring")):
-            f["item35a"] = "/Yes"
-        if self._has_items(self.activity.get("30_TerroristFinancing")):
-            f["item35t"] = "/Yes"
-        if self._contains_case_insensitive(self.activity.get("31_Fraud"), "wire"):
-            f["item35r"] = "/Yes"
-        if self._has_items(self.activity.get("33_MoneyLaundering")):
-            f["item35a"] = "/Yes"
-        if self._has_items(self.activity.get("38_MortgageFraud")):
-            f["item35p"] = "/Yes"
-
-        other = self.activity.get("35_OtherSuspiciousActivities", [])
-        if self._has_items(other):
+        summary_fields, summary_notes = self._map_summary_characterization_fields()
+        f.update(summary_fields)
+        if summary_notes:
             f["item35s"] = "/Yes"
-            f["item35s-1"] = "; ".join(self._to_list(other))[:100]
+            f["item35s-1"] = "; ".join(summary_notes)[:100]
 
         f["item38"] = "/1"
         f["item39"] = "/1"
@@ -367,7 +377,7 @@ class SARFieldMapper:
         if flags:
             blocks.append(f"RED FLAGS DETECTED: {'; '.join(flags)}")
 
-        amount = self.activity.get("26_AmountInvolved", {}).get("amount_usd", 0)
+        amount = self._resolve_amount_involved()
         if amount:
             blocks.append(f"TOTAL AMOUNT INVOLVED: ${float(amount):,.2f}")
 
@@ -414,6 +424,224 @@ class SARFieldMapper:
 
         narrative = "\n\n".join(blocks)
         return {"item51": narrative[:4000]}
+
+    def _resolve_amount_involved(self) -> float:
+        """
+        Resolve SAR amount with fallbacks used by different pipeline stages.
+        Priority:
+        1) SuspiciousActivityInformation.26_AmountInvolved.amount_usd
+        2) top-level total_amount_involved
+        3) sum(transactions[].amount_usd|amount)
+        """
+        amount_info = self.activity.get("26_AmountInvolved", {})
+        if isinstance(amount_info, dict):
+            amount = self._to_float(amount_info.get("amount_usd"))
+            if amount > 0:
+                return amount
+
+        amount = self._to_float(self.case.get("total_amount_involved"))
+        if amount > 0:
+            return amount
+
+        tx_total = 0.0
+        for tx in self.txns:
+            if not isinstance(tx, dict):
+                continue
+            tx_total += self._to_float(tx.get("amount_usd"))
+            if self._to_float(tx.get("amount_usd")) == 0:
+                tx_total += self._to_float(tx.get("amount"))
+        return tx_total
+
+    @staticmethod
+    def _to_float(value: Any) -> float:
+        try:
+            if isinstance(value, str):
+                cleaned = value.replace(",", "").replace("$", "").strip()
+                return float(cleaned or 0)
+            return float(value or 0)
+        except (TypeError, ValueError):
+            return 0.0
+
+    def _map_summary_characterization_fields(self) -> tuple[Dict[str, str], List[str]]:
+        """
+        Map SAR item 35 summary characterization checkboxes conservatively.
+        Returns checkbox fields plus free-text notes for item35s-1.
+        """
+        fields: Dict[str, str] = {}
+        notes: List[str] = []
+
+        structuring = self._to_list(self.activity.get("29_Structuring"))
+        fraud = self._to_list(self.activity.get("31_Fraud"))
+        money_laundering = self._to_list(self.activity.get("33_MoneyLaundering"))
+        other = self._to_list(self.activity.get("35_OtherSuspiciousActivities"))
+        mortgage = self._to_list(self.activity.get("38_MortgageFraud"))
+        terrorist = self._to_list(self.activity.get("30_TerroristFinancing"))
+
+        if structuring or money_laundering:
+            fields["item35a"] = "/Yes"
+        if mortgage:
+            fields["item35t"] = "/Yes"
+
+        fraud_text = " | ".join(fraud).lower()
+        keyword_map = {
+            "item35c": ("check fraud", "check"),
+            "item35d": ("kiting",),
+            "item35e": ("commercial loan",),
+            "item35f": ("computer intrusion", "cyber", "malware", "phishing"),
+            "item35g": ("consumer loan",),
+            "item35h": ("counterfeit check",),
+            "item35i": ("counterfeit credit", "counterfeit debit"),
+            "item35j": ("counterfeit instrument",),
+            "item35k": ("credit card fraud", "credit card"),
+            "item35l": ("debit card fraud", "debit card"),
+            "item35m": ("embezzlement", "defalcation"),
+            "item35n": ("false statement",),
+            "item35o": ("financial institution fraud", "institution fraud"),
+            "item35p": ("identity theft", "account takeover"),
+            "item35r": ("mail fraud",),
+            "item35u": ("mysterious disappearance",),
+        }
+        for field_id, needles in keyword_map.items():
+            if any(needle in fraud_text for needle in needles):
+                fields[field_id] = "/Yes"
+
+        # No dedicated legacy checkbox for wire fraud; keep it in free-text.
+        if "wire fraud" in fraud_text:
+            notes.append("Wire fraud")
+
+        notes.extend(other)
+        notes.extend(terrorist)
+
+        if not fields and (structuring or fraud or money_laundering or other or mortgage or terrorist):
+            fields["item35s"] = "/Yes"
+
+        return fields, notes
+
+    def _map_fincen_acroform(self) -> Dict[str, str]:
+        """
+        Map key values to the newer FinCEN SAR AcroForm field names.
+
+        This map is intentionally conservative (text fields only) because
+        checkbox/radio export values in this template are not stable labels.
+        """
+        f: Dict[str, str] = {}
+
+        subject_type = (self.subject.get("type", "") or "").lower()
+        subject_name = self.subject.get("name", "") or ""
+        treat_as_entity = subject_type != "individual" or self._looks_like_entity_name(subject_name)
+        if not treat_as_entity:
+            parsed = self._split_individual_name(subject_name)
+            f["3  Individuals last name or entitys legal name a Unk"] = parsed["last"]
+            f["4  First name a Unk"] = parsed["first"]
+            f["5  Middle initial"] = parsed["middle"][:1]
+        else:
+            f["3  Individuals last name or entitys legal name a Unk"] = subject_name
+
+        fallback_city, fallback_state = self._city_state_from_txns()
+        subject_city = (self.subject.get("city", "") or "").strip() or fallback_city
+        subject_state = (self.subject.get("state", "") or "").strip()[:2] or fallback_state
+        subject_zip = (
+            (self.subject.get("zip", "") or "").strip()
+            or (self.subject.get("postal_code", "") or "").strip()
+        )
+        subject_address = (self.subject.get("address", "") or "").strip()
+        if not subject_address:
+            subject_address = self._compose_address_line(subject_city, subject_state, subject_zip)
+
+        f["7  Occupation or type of business"] = self.subject.get("industry_or_occupation", "")
+        f["8 Address a Unk"] = subject_address
+        f["9  City a Unk"] = subject_city
+        f["11  ZIPPostal Code a Unk"] = subject_zip
+        country = (self.subject.get("country", "US") or "US").strip().upper()[:2]
+        f["12  Country code"] = country
+
+        subject_tin = (
+            self.subject.get("tin")
+            or self.subject.get("ssn")
+            or self.subject.get("ein")
+            or ""
+        )
+        f["13  TIN a Unk"] = subject_tin
+
+        alert_email = (
+            self.case.get("institution", {}).get("contact_email")
+            if isinstance(self.case.get("institution"), dict)
+            else ""
+        ) or ""
+        f["19 Email adress (If available)"] = alert_email
+
+        inst_city = (self.inst.get("branch_city", "") or "").strip() or fallback_city
+        inst_state = (self.inst.get("branch_state", "") or "").strip()[:2] or fallback_state
+        inst_zip = (
+            (self.inst.get("zip", "") or "").strip()
+            or (self.inst.get("postal_code", "") or "").strip()
+        )
+        inst_address = (self.inst.get("address", "") or "").strip()
+        if not inst_address:
+            inst_address = self._compose_address_line(inst_city, inst_state, inst_zip)
+
+        f["53  Legal name of financial institution a  Unk"] = self.inst.get("name", "")
+        f["55  TIN a  Unk"] = self.inst.get("ein", "")
+        f["57  Address a  Unk"] = inst_address
+        f["58  City a  Unk"] = inst_city
+        f["59 State"] = inst_state
+        f["60  ZIPPostal Code"] = inst_zip
+
+        contact_name = self.inst.get("contact_officer", "") or ""
+        f["79 Filer name"] = contact_name
+        f[" 96 Filing institution contact office"] = "Compliance Office"
+        f["97  Filing institution contact office phone number Include Area Code"] = (
+            self._normalize_phone(self.inst.get("contact_phone", ""))
+        )
+
+        if self._as_bool(self.le.get("contacted", False)):
+            f["92  LE contact agency"] = self.le.get("agency", "") or ""
+            f["93  LE contact name"] = self.le.get("contact_name", "") or ""
+            f["94  LE contact phone number Include Area Code"] = self._normalize_phone(
+                self.le.get("phone", "")
+            )
+
+        narrative = self._map_narrative().get("item51", "")
+        if narrative:
+            f["Narrative"] = narrative
+
+        return f
+
+    def _city_state_from_txns(self) -> tuple[str, str]:
+        for tx in self.txns:
+            location = tx.get("location", "") or ""
+            if "," in location:
+                city, state = location.split(",", 1)
+                return city.strip(), state.strip()[:2]
+        return "", ""
+
+    @staticmethod
+    def _compose_address_line(city: str, state: str, zip_code: str) -> str:
+        city = (city or "").strip()
+        state = (state or "").strip()
+        zip_code = (zip_code or "").strip()
+        parts = []
+        if city or state:
+            parts.append(", ".join(part for part in [city, state] if part))
+        if zip_code:
+            if parts:
+                parts[0] = f"{parts[0]} {zip_code}".strip()
+            else:
+                parts.append(zip_code)
+        return parts[0] if parts else ""
+
+    @staticmethod
+    def _looks_like_entity_name(name: str) -> bool:
+        upper = f" {(name or '').upper()} "
+        entity_tokens = (" LLC ", " INC ", " CORP ", " CORPORATION ", " LTD ", " COMPANY ", " CO. ")
+        return any(token in upper for token in entity_tokens)
+
+    @staticmethod
+    def _normalize_phone(value: str) -> str:
+        digits = re.sub(r"\D", "", value or "")
+        if len(digits) == 11 and digits.startswith("1"):
+            digits = digits[1:]
+        return digits[:10] if digits else ""
 
 
 class CTRFieldMapper:

@@ -1,387 +1,530 @@
-# Agentic BNY AI Compliance
+# Agentic_BNY_AI_Compliance
 
-Multi-agent compliance reporting system.
+Production-style multi-agent compliance reporting system for SAR/CTR workflows.
 
-## What This Project Does
+This repository contains:
+- FastAPI backend (`backend/`) with CrewAI orchestration
+- Streamlit UI (`streamlit_app/`) for analyst workflows
+- Knowledge layer using Supabase + Weaviate + Redis
+- PDF filing tools for SAR/CTR templates
 
-This project accepts transaction data, determines the report type (SAR/CTR/Sanctions), gathers context from a knowledge base, generates a narrative, validates report quality/compliance, and produces a PDF report.
+---
 
-## Architecture
+## Table of Contents
 
-Core components:
+1. [What the System Does](#what-the-system-does)
+2. [Current Agent Workflow](#current-agent-workflow)
+3. [Architecture and Data Stores](#architecture-and-data-stores)
+4. [Repository Layout](#repository-layout)
+5. [Prerequisites](#prerequisites)
+6. [Environment Variables](#environment-variables)
+7. [Local Setup (Step-by-Step)](#local-setup-step-by-step)
+8. [Initialize and Seed Knowledge Base](#initialize-and-seed-knowledge-base)
+9. [Run Backend and Frontend](#run-backend-and-frontend)
+10. [How to Test End-to-End](#how-to-test-end-to-end)
+11. [UI Usage Guide](#ui-usage-guide)
+12. [API Reference (Current)](#api-reference-current)
+13. [PDF Filing Behavior and Field Mapping Notes](#pdf-filing-behavior-and-field-mapping-notes)
+14. [Troubleshooting](#troubleshooting)
+15. [Operational Notes for Teammates](#operational-notes-for-teammates)
+16. [Security Notes](#security-notes)
 
-- API: FastAPI + CrewAI orchestration
-- PostgreSQL: durable relational data (`report_schemas`, `validation_rules`, `field_mappings`, `risk_indicators`, `job_status`, `audit_log`)
-- Weaviate: semantic retrieval for similar narratives and regulations
-- Redis: caching for schema/rules/mappings/indicators
+---
 
-## Request Flow (End to End)
+## What the System Does
 
-1. `POST /api/v1/reports/submit` receives `transaction_data`.
-2. API creates a job record in Postgres (`pending`).
-3. Background task runs `create_compliance_crew(...)`.
-4. Router agent classifies report type and checks KB availability.
-5. If KB is missing data, Researcher agent fetches regulatory sources and updates KB.
-6. Aggregator + Narrative + Validator agents run sequentially.
-7. If approved, Filer agent generates PDF and stores output metadata.
-8. Job status/result is updated in Postgres.
-9. Client polls status and downloads PDF when ready.
+Given a transaction case (JSON or text input converted to JSON), the system:
+1. Classifies filing type (`SAR`, `CTR`, `BOTH`, or none)
+2. Aggregates and maps case fields into report-ready structures
+3. Generates SAR narrative only when required
+4. Validates quality/compliance (or bypasses in testing mode)
+5. Fills PDF templates and returns downloadable report(s)
 
-## API Endpoints
+Output artifacts include:
+- Job status and progress per stage
+- Aggregated case payload(s)
+- Narrative payload (SAR path)
+- Validation outcome
+- Final filed PDF path(s)
 
-Base router prefix: `/api/v1`
+---
 
-- `POST /api/v1/reports/submit`
-- `GET /api/v1/reports/{job_id}/status`
-- `GET /api/v1/reports/{job_id}/download`
-- `GET /api/v1/kb/search`
+## Current Agent Workflow
 
-Health endpoint (outside router prefix):
+### Active orchestration path (current runtime)
 
-- `GET /health`
+- Agent 1: **Router** (CrewAI)
+- Agent 2: **Researcher** is intentionally skipped
+- Agent 3: **Aggregator** (schema-aware mapper, Supabase-backed schema lookup)
+- Agent 4: **Narrative** (only when `narrative_required=true`)
+- Agent 5: **Validator** (CrewAI), or bypassed with `SKIP_VALIDATOR_FOR_TESTING=true`
+- Agent 6: **Filer** (deterministic PDF filling)
 
-## Agent Roles
+### Execution flow
 
-- Router: chooses report type and summarizes rationale
-- Researcher: finds official regulatory info and updates KB
-- Aggregator: maps raw transaction data to report schema and flags missing fields/risk indicators
-- Narrative: writes professional compliance narrative
-- Validator: checks technical completeness, compliance, and quality
-- Filer: produces final PDF report
+1. `POST /api/v1/reports/submit`
+2. Job record is created in DB (`job_status` table)
+3. Background task starts Crew workflow
+4. Router classifies report types
+5. Aggregator maps per report type (`aggregator_by_type`)
+6. Narrative runs only for SAR when required
+7. Validator runs unless bypassed
+8. Filer generates PDF(s) on approved path
+9. Job status is updated (`processing` -> `completed`/`failed`)
 
-## Knowledge Base Design
+---
 
-`KBManager` coordinates:
+## Architecture and Data Stores
 
-- Postgres for structured compliance metadata
-- Weaviate for semantic retrieval
-- Redis cache to reduce repeated DB reads
-- OpenAI embeddings + fallback LLM narrative generation
+### Backend
+- FastAPI (`backend/api/main.py`, `backend/api/routes.py`)
+- Crew orchestration (`backend/orchestration/crew.py`)
+- Agents (`backend/agents/*.py`)
+- PDF tools and field mapping (`backend/tools/pdf_tools.py`, `backend/tools/field_mapper.py`)
 
-Weaviate collections:
+### Data services
 
-- `Narratives`
-- `Regulations`
-- `Definitions`
+- **Supabase/Postgres (SQLAlchemy client in `supabase_client.py`)**
+  - Job lifecycle (`job_status`)
+  - Audit logs (`audit_log`)
+  - Optional schema/rules/mappings persistence tables
 
-## How Agents Access KB Content
+- **Supabase REST (via `SUPABASE_URL` + `SUPABASE_ANON_KEY`)**
+  - `report_types` table (schema/rules/mapping/narrative config)
+  - `narrative_examples` table
 
-Use this flow for any teammate/agent that needs knowledge base reads/writes.
+- **Weaviate**
+  - semantic retrieval for regulations/narratives/definitions
 
-1. Start from project root and use the project virtualenv (not Conda):
+- **Redis**
+  - cache for schema/rules/mappings/lookups
+
+---
+
+## Repository Layout
+
+```text
+backend/
+  agents/
+  api/
+  config/
+  knowledge_base/
+  orchestration/
+  tools/
+
+streamlit_app/
+  app.py
+  pages/
+  components/
+  styles/
+  utils/
+
+knowledge_base/
+  schemas/
+  regulations/
+  narratives/
+  documents/pdf_templates/
+
+scripts/
+  preflight.py
+  init_weaviate.py
+  seed_kb.py
+  e2e_submit_check.py
+  test_pdf_filer.py
+  test_ctr_filer.py
+  test_crew.py
+```
+
+---
+
+## Prerequisites
+
+- Python 3.11+ (3.12 tested)
+- `pip`
+- Local Redis (unless using remote Redis)
+- Weaviate (local or cloud)
+- Postgres-compatible DB for job storage (local Postgres or Supabase DB)
+- OpenAI API key for embedding/LLM operations
+
+---
+
+## Environment Variables
+
+Use `.env.example` as base.
+
+### Required in practice
+
+- `OPENAI_API_KEY`
+- `WEAVIATE_URL`
+- `REDIS_URL`
+- A working DB DSN path via one of:
+  - `SUPABASE_DB_URL`
+  - or `SUPABASE_DB_HOST` + `SUPABASE_DB_PASSWORD` (+ related components)
+  - or fallback `DATABASE_URL`
+
+### Required for Supabase REST-backed KB reads
+
+- `SUPABASE_URL` (HTTP URL, e.g. `https://<project_ref>.supabase.co`)
+- `SUPABASE_ANON_KEY`
+
+### Important URL distinction
+
+- `SUPABASE_URL` must be **HTTP(S)** for REST API access.
+- DB connection must be **PostgreSQL DSN** (`postgresql://...`) via DB vars.
+- Do not put HTTP URL into DB DSN fields.
+
+### Validator bypass toggle
+
+- `SKIP_VALIDATOR_FOR_TESTING=true`
+  - bypasses Agent 5
+  - auto-approves for filing
+  - useful for integration tests and PDF mapping iteration
+
+---
+
+## Local Setup (Step-by-Step)
+
+From repo root:
 
 ```bash
 cd Agentic_BNY_AI_Compliance
-conda deactivate 2>/dev/null || true
-source .venv/bin/activate
-```
-
-2. Load environment variables and confirm connectivity:
-
-```bash
-set -a
-source .env
-set +a
-python scripts/preflight.py
-```
-
-3. Initialize collections and seed baseline KB content:
-
-```bash
-python scripts/init_weaviate.py
-python scripts/seed_kb.py
-python scripts/ingest_regulation_json.py --input knowledge_base/regulations/sar_filing_instructions.json
-```
-
-4. Start API and confirm all KB components are healthy:
-
-```bash
-uvicorn backend.api.main:app --host 0.0.0.0 --port 8001 --reload
-curl http://localhost:8001/health
-```
-
-Expected:
-
-```json
-{"status":"healthy","services":{"postgres":true,"weaviate":true,"redis":true}}
-```
-
-5. Agent-level access (recommended): use CrewAI KB tools from `backend/tools/kb_tools.py`.
-
-- `Search Knowledge Base`:
-  - Inputs: `query`, `collection` (`narratives|regulations|definitions`), optional `filters`, `limit`
-- `Get Report Schema`:
-  - Input: `report_type` (`SAR|CTR|...`)
-- `Get Validation Rules`:
-  - Input: `report_type`
-- `Get Field Mappings`:
-  - Input: `report_type`
-- `Add to Knowledge Base`:
-  - Inputs: `collection` (`narratives|regulations`), `data` (JSON string)
-- `Convert Structured Data to Narrative`:
-  - Input: `transaction_data` (JSON string)
-
-6. Programmatic access (Python, no CrewAI prompt needed):
-
-```python
-from backend.knowledge_base.kb_manager import KBManager
-
-kb = KBManager()
-print(kb.search_regulations("CTR and SAR relationship", top_k=3))
-print(kb.find_similar_narratives("multiple cash deposits below threshold", top_k=3))
-print(kb.get_schema("SAR"))
-```
-
-7. API access (for external services/UI):
-
-```bash
-curl "http://localhost:8001/api/v1/kb/search?q=structuring&collection=regulations&limit=5"
-curl "http://localhost:8001/api/v1/kb/search?q=wire+fraud&collection=narratives&limit=5"
-```
-
-8. Add new regulation documents safely (dedupe on by default):
-
-```bash
-python scripts/ingest_regulation_json.py --input knowledge_base/regulations/<your_file>.json
-```
-
-Use `--force` only when you intentionally want duplicates:
-
-```bash
-python scripts/ingest_regulation_json.py --input knowledge_base/regulations/<your_file>.json --force
-```
-
-9. If a KB call fails, check in this order:
-
-- wrong Python (`which python` must point to `.venv/bin/python`)
-- `.env` not loaded in current shell
-- stale Weaviate URL or missing scheme (`https://...`)
-- invalid/missing `WEAVIATE_API_KEY` for cloud
-- `OPENAI_API_KEY` missing (required for embeddings on insert/search)
-
-## Configuration
-
-Runtime settings are loaded from environment variables (`backend/config/settings.py`).
-
-Key variables:
-
-- `DATABASE_URL`
-- `POSTGRES_DB`
-- `POSTGRES_USER`
-- `POSTGRES_PASSWORD`
-- `WEAVIATE_URL`
-- `WEAVIATE_API_KEY`
-- `WEAVIATE_STARTUP_PERIOD` (optional, default `20`; increase if cloud readiness checks are slow)
-- `REDIS_URL`
-- `OPENAI_API_KEY`
-- `GEMINI_API_KEY`
-
-## Local Run
-
-1. Create `.env` from template:
-
-```bash
-cp .env.example .env
-```
-
-2. Create and activate a virtual environment:
-
-```bash
 python -m venv .venv
 source .venv/bin/activate
 pip install -r requirements.txt
+cp .env.example .env
 ```
 
-3. If you use Conda, deactivate it first so scripts use `.venv` packages:
+If you use Conda, deactivate first to avoid interpreter/package mismatch:
 
 ```bash
-conda deactivate
+conda deactivate 2>/dev/null || true
 source .venv/bin/activate
 which python
 ```
 
-4. Configure environment variables in `.env`.
+Expected `which python` -> `.venv/bin/python`
 
-- For Weaviate Cloud, use a full HTTPS URL and API key:
-  - `WEAVIATE_URL=https://<your-cluster>.weaviate.cloud`
-  - `WEAVIATE_API_KEY=<your-weaviate-api-key>`
-- For local Weaviate:
-  - `WEAVIATE_URL=http://localhost:8080`
-  - `WEAVIATE_API_KEY=` (empty for anonymous local mode)
+---
 
-5. Ensure PostgreSQL, Redis, and Weaviate are reachable from `.env`.
+## Initialize and Seed Knowledge Base
 
-6. Run preflight checks (recommended for teammates):
+### 1) Preflight checks
 
 ```bash
+source .venv/bin/activate
+set -a; source .env; set +a
 python scripts/preflight.py
 ```
 
-7. Initialize and seed the knowledge base:
+### 2) Init Weaviate classes
 
 ```bash
 python scripts/init_weaviate.py
+```
+
+### 3) Seed KB
+
+```bash
 python scripts/seed_kb.py
 ```
 
-8. Start the API from project root (use any free port):
+Notes:
+- If no real DB DSN is configured, `seed_kb.py` enters REST-only mode and skips SQL table seeding.
+- Weaviate seeding still runs.
+
+---
+
+## Run Backend and Frontend
+
+### Backend
 
 ```bash
-uvicorn backend.api.main:app --host 0.0.0.0 --port 8001 --reload
+source .venv/bin/activate
+uvicorn backend.api.main:app --reload --port 8001
 ```
 
-9. Health check:
+Health check:
 
 ```bash
-curl http://localhost:8001/health
+curl http://127.0.0.1:8001/health
 ```
 
-Expected response:
+Expected shape:
 
 ```json
-{"status":"healthy","services":{"postgres":true,"weaviate":true,"redis":true}}
+{"status":"healthy","services":{"database":true,"weaviate":true,"redis":true}}
 ```
 
-10. Stop with `Ctrl+C`.
+### Frontend (Streamlit)
 
-## Team Onboarding Checklist
-
-Use this exact sequence on a new machine:
-
-```bash
-git clone <repo-url>
-cd Agentic_BNY_AI_Compliance
-cp .env.example .env
-python -m venv .venv
-source .venv/bin/activate
-pip install -r requirements.txt
-python scripts/preflight.py
-python scripts/init_weaviate.py
-python scripts/seed_kb.py
-uvicorn backend.api.main:app --host 0.0.0.0 --port 8001 --reload
-```
-
-If `python scripts/preflight.py` fails, fix those service/env issues first before running seed/API.
-
-## External Services
-
-The API depends on:
-
-- PostgreSQL (for report schemas, rules, jobs, audit data)
-- Weaviate (for vector search and retrieval)
-- Redis (for caching)
-
-The app can start even if some services are down, but feature behavior depends on them:
-
-- Postgres down: report job/state operations fail
-- Redis down: cache falls back to direct datastore reads
-- Weaviate down: semantic KB operations fail (search/add/regulatory retrieval)
-
-## Troubleshooting
-
-### 1) `password authentication failed for user "postgres"`
-
-Cause: something is using old Postgres credentials.
-
-Check:
-
-- `DATABASE_URL` in `.env`
-- any hardcoded DB URL usage
-
-Current `PostgreSQLClient` resolves DB URL from runtime settings, not hardcoded defaults.
-
-### 2) Weaviate `401 anonymous access not enabled`
-
-Cause: API key auth is enabled in Weaviate but client did not send key.
-
-Fix:
-
-- Ensure `WEAVIATE_API_KEY` is set in `.env`
-- Ensure `WEAVIATE_URL` points to your reachable Weaviate endpoint
-- Weaviate client must use API key auth
-
-### 3) Weaviate `MissingSchema: Invalid URL ... No scheme supplied`
-
-Cause: `WEAVIATE_URL` is missing `http://` or `https://`.
-
-Fix:
-
-- Cloud: `WEAVIATE_URL=https://<cluster>.weaviate.cloud`
-- Local: `WEAVIATE_URL=http://localhost:8080`
-
-### 4) `ModuleNotFoundError: No module named 'pkg_resources'`
-
-Cause: CrewAI dependency path requires `pkg_resources`; newer `setuptools` removed it.
-
-Fix:
-
-- Keep `setuptools<81` (already pinned in `requirements.txt`)
-- Reinstall in venv: `python -m pip install --force-reinstall "setuptools<81"`
-
-### 5) `Address already in use` when starting Uvicorn
-
-Cause: selected port is already bound by another process.
-
-Fix:
-
-- Use a free port (for example `8002`)
-- Or stop the existing listener:
-  - `kill -9 $(lsof -ti tcp:8001 -sTCP:LISTEN) 2>/dev/null || true`
-
-### 6) CrewAI `Function must have a docstring`
-
-Cause: `@tool` decorated functions without docstrings.
-
-Fix: add docstrings to all tool functions.
-
-### 7) Frequent health-check log noise
-
-`/health` performs real checks for Postgres/Weaviate/Redis. If any upstream dependency is misconfigured, failures will repeat on each health call until fixed.
-
-### 8) Warnings about Pydantic/Weaviate versions
-
-Current warnings are non-fatal. They are upgrade hygiene tasks, not runtime blockers.
-
-## Security Notes
-
-- Never commit real secrets.
-- `.gitignore` excludes `.env` files.
-- Rotate keys if they were ever exposed in logs/chat/screenshots.
-
-## GitHub Push (Quick)
-
-```bash
-git add .
-git commit -m "Initial commit"
-git branch -M main
-git remote add origin https://github.com/tursunait/Agentic_BNY_AI_Compliance.git
-git push -u origin main
-```
-
-Example runs: 
-
-
-curl http://localhost:8001/health    
-
+Run in a separate terminal:
 
 ```bash
 source .venv/bin/activate
-python scripts/test_pdf_filer.py --input data/CASE-2023-687870__CAT-29-33-35.json --report-type SAR
+streamlit run streamlit_app/app.py --server.port 8501
 ```
+
+Open:
+- `http://localhost:8501`
+
+Current sidebar navigation intentionally shows:
+- Home
+- Dashboard
+- Submit Case
+- Case Management
+- Settings
+
+---
+
+## How to Test End-to-End
+
+### A) API E2E smoke test
 
 ```bash
 source .venv/bin/activate
-python scripts/test_pdf_filer.py --input data/CASE-2024-170507__CAT-29-33-35.json --report-type SAR
+python scripts/e2e_submit_check.py
 ```
+
+This submits:
+- one SAR-only case (expects narrative path)
+- one CTR-only case (expects narrative skip)
+
+Expected final line:
+- `PASS: End-to-end checks succeeded.`
+
+### B) Direct PDF filer tests
 
 ```bash
 source .venv/bin/activate
-python scripts/test_pdf_filer.py --input data/CASE-2025-456266__CAT-29-31-33-35.json --report-type SAR
-```
-
-```bash
-source .venv/bin/activate
+python scripts/test_pdf_filer.py --input data/CASE-2024-677021.json --report-type SAR
 python scripts/test_pdf_filer.py --input data/ctr_test_case.json --report-type CTR
 ```
 
-ctr_report.pdf
+### C) Full orchestration test from script
+
+```bash
+source .venv/bin/activate
+python scripts/test_crew.py --input data/CASE-2024-677021.json
+```
+
+---
+
+## UI Usage Guide
+
+## Home
+- KPI cards
+- recent activity
+- primary action: submit new case
+
+## Submit Case
+Input methods:
+- **Text Input**
+  - supports plain text extraction (amount/date heuristics)
+  - also supports pasted JSON (raw JSON, fenced JSON, embedded JSON)
+- **Upload JSON**
+  - recommended for exact field fidelity
+- **Manual Entry**
+  - builds structured payload from form fields
+- **Batch Upload**
+  - placeholder currently
+- **Direct PDF Filing**
+  - bypasses agent pipeline and directly fills PDF from JSON path
+
+## Case Management
+- list tracked cases
+- stage timeline
+- case details
+- download artifacts when completed
+
+## Dashboard
+- overview metrics and trend charts
+
+## Settings
+- API base URL, timeout, retry
+- user profile and display options
+
+---
+
+## API Reference (Current)
+
+Router prefix: `/api/v1`
+
+### Implemented endpoints
+
+- `POST /api/v1/reports/submit`
+- `GET /api/v1/reports/{job_id}/status`
+- `GET /api/v1/reports/{job_id}/download`
+- `POST /api/v1/reports/file-direct`
+- `GET /api/v1/kb/search`
+
+Global health endpoint:
+- `GET /health`
+
+Note:
+- Some UI client methods include fallback behavior when optional endpoints are absent (`/cases/*`, `/reports/list`, `/dashboard/metrics`).
+
+---
+
+## PDF Filing Behavior and Field Mapping Notes
+
+### Templates
+
+SAR filer auto-selects best template match between:
+- `knowledge_base/documents/pdf_templates/fincen_sar_form_acroform.pdf`
+- `knowledge_base/documents/pdf_templates/sar_report.pdf`
+
+CTR template:
+- `knowledge_base/documents/pdf_templates/ctr_report.pdf`
+
+### Key SAR mapping details
+
+- Field 34 (`Total dollar amount involved`) is dollar-only in legacy form:
+  - cents are not represented in the numeric boxes
+  - mapper fills both `item34` and `item34-1..item34-11`
+
+- Entity name handling:
+  - names like `LLC`, `INC`, `CORP` are treated as entity-style mapping even if `subject.type` is mislabeled
+
+- Address fallback:
+  - if address missing, mapper backfills from available `city/state/zip`
+  - transaction location is used as fallback source when needed
+
+- Item 35 summary characterization:
+  - mapping uses conservative category/keyword logic
+  - unmatched categories are preserved in `item35s-1` (other text)
+
+### PDF appearance and duplication fixes
+
+- `NeedAppearances` set to improve viewer rendering
+- duplicate-page writes were removed (no double page sets)
+
+---
+
+## Troubleshooting
+
+### 1) `zsh: command not found: app.py`
+Use Streamlit runner, not direct python script execution:
+
+```bash
+streamlit run streamlit_app/app.py --server.port 8501
+```
+
+### 2) `ModuleNotFoundError: No module named 'streamlit_app'`
+Run from repository root:
+
+```bash
+cd Agentic_BNY_AI_Compliance
+streamlit run streamlit_app/app.py --server.port 8501
+```
+
+### 3) UUID parsing errors in status endpoint
+Do not pass placeholders like `<REAL_UUID>` literally.
+Use the actual `job_id` returned from submit.
+
+### 4) `jq: Unknown option --argfile`
+Use Python-based payload construction or a compatible jq invocation.
+
+### 5) DB connection errors (`password authentication failed`, `connection refused`)
+Validate DB env vars:
+- host/user/password/port/db
+- DSN format
+- whether local or Supabase DB is reachable from your machine
+
+### 6) Supabase REST 400 on `report_types`
+Check table schema and column names used by code:
+- `report_type`
+- `json_schema`
+- `narrative_required`
+- `narrative_instructions`
+- `validation_rules`
+- `pdf_template_path`
+- `pdf_field_mapping`
+
+### 7) UI styling looks inconsistent across pages
+After updates:
+- restart Streamlit
+- hard refresh browser (`Cmd+Shift+R`)
+
+### 8) Port already in use
+
+```bash
+lsof -ti tcp:8001 -sTCP:LISTEN
+kill -9 <pid>
+```
+
+### 9) Weaviate URL errors
+Always include scheme:
+- `http://localhost:8080` (local)
+- `https://<cluster>.weaviate.cloud` (cloud)
+
+---
+
+## Operational Notes for Teammates
+
+### Standard daily run
+
+1. Activate venv and load env:
+
+```bash
+source .venv/bin/activate
+set -a; source .env; set +a
+```
+
+2. Start backend:
+
+```bash
+uvicorn backend.api.main:app --reload --port 8001
+```
+
+3. Start frontend:
+
+```bash
+streamlit run streamlit_app/app.py --server.port 8501
+```
+
+4. Test with Upload JSON first for deterministic mapping.
+
+### Recommended testing mode during integration
+
+Set in `.env`:
+
+```env
+SKIP_VALIDATOR_FOR_TESTING=true
+```
+
+Use this while validating Router -> Aggregator -> Narrative -> Filer behavior.
+
+---
+
+## Security Notes
+
+- Do not commit `.env` or credentials.
+- Rotate API keys if exposed.
+- Use least-privilege Supabase keys in shared environments.
+- Audit and sanitize case data before sharing externally.
+
+---
+
+## Quick Start Commands (Copy/Paste)
+
+```bash
+cd Agentic_BNY_AI_Compliance
+python -m venv .venv
+source .venv/bin/activate
+pip install -r requirements.txt
+cp .env.example .env
+set -a; source .env; set +a
+python scripts/preflight.py
+python scripts/init_weaviate.py
+python scripts/seed_kb.py
+uvicorn backend.api.main:app --reload --port 8001
+```
+
+New terminal:
+
+```bash
+cd Agentic_BNY_AI_Compliance
+source .venv/bin/activate
+streamlit run streamlit_app/app.py --server.port 8501
+```
+

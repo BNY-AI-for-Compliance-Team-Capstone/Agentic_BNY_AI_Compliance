@@ -36,7 +36,7 @@ def main() -> int:
     )
     parser.add_argument(
         "--sar-template",
-        default="knowledge_base/documents/pdf_templates/sar_report.pdf",
+        default="knowledge_base/documents/pdf_templates/fincen_sar_form_acroform.pdf",
         help="Path to fillable SAR template PDF",
     )
     parser.add_argument(

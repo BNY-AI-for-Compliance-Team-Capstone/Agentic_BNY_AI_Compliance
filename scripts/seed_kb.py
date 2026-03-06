@@ -11,9 +11,11 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from backend.knowledge_base.kb_manager import KBManager
-from backend.knowledge_base.postgres_client import PostgreSQLClient
+from backend.knowledge_base.supabase_client import SupabaseClient
+from backend.config.settings import settings
 
 SAR_SCHEMA_PATH = ROOT / "knowledge_base" / "schemas" / "sar_schema.json"
+CTR_SCHEMA_PATH = ROOT / "knowledge_base" / "schemas" / "ctr_schema.json"
 
 
 def load_schema(schema_path: Path) -> Dict[str, Any]:
@@ -30,34 +32,50 @@ def load_schema(schema_path: Path) -> Dict[str, Any]:
     return schema
 
 
-def seed_postgres(db: PostgreSQLClient) -> None:
+def seed_database(db: SupabaseClient) -> None:
     db.create_tables()
-    sar_schema = load_schema(SAR_SCHEMA_PATH)
-    report_type = sar_schema.get("report_type", "SAR")
-    version = sar_schema.get("version", "1.0")
-    effective_date = sar_schema.get("effective_date", date.today().isoformat())
+    schema_paths = [SAR_SCHEMA_PATH, CTR_SCHEMA_PATH]
+    added_report_types = []
+    for schema_path in schema_paths:
+        schema = load_schema(schema_path)
+        report_type = schema.get("report_type")
+        if not report_type:
+            raise ValueError(f"Missing report_type in schema file: {schema_path}")
+        version = schema.get("version", "1.0")
+        effective_date = schema.get("effective_date", date.today().isoformat())
 
-    db.add_schema(
-        report_type=report_type,
-        version=version,
-        schema_json=sar_schema,
-        effective_date=effective_date,
-    )
-    print(f"✓ Added {report_type} schema from {SAR_SCHEMA_PATH}")
+        db.add_schema(
+            report_type=report_type,
+            version=version,
+            schema_json=schema,
+            effective_date=effective_date,
+        )
+        added_report_types.append(report_type)
+        print(f"✓ Added {report_type} schema from {schema_path}")
 
     rules = [
         {
             "rule_id": "SAR-C001",
-            "report_type": report_type,
+            "report_type": "SAR",
             "severity": "critical",
             "rule_json": {
                 "condition": "subject.last_name IS NOT NULL OR subject.ssn IS NOT NULL",
                 "message": "Subject must have last name or SSN",
             },
-        }
+        },
+        {
+            "rule_id": "CTR-C001",
+            "report_type": "CTR",
+            "severity": "critical",
+            "rule_json": {
+                "condition": "total_cash_amount >= 10000",
+                "message": "CTR requires total cash amount at or above $10,000",
+            },
+        },
     ]
     for rule in rules:
-        db.add_validation_rule(rule)
+        if rule["report_type"] in added_report_types:
+            db.add_validation_rule(rule)
     print(f"✓ Added {len(rules)} validation rules")
 
 
@@ -97,10 +115,14 @@ def seed_weaviate(kb: KBManager) -> None:
 
 def main() -> None:
     print("Seeding Knowledge Base...")
-    db = PostgreSQLClient()
     kb = KBManager()
-    print("\n1. Seeding PostgreSQL...")
-    seed_postgres(db)
+    print("\n1. Seeding database...")
+    should_seed_db = settings.has_database_dsn()
+    if should_seed_db:
+        db = SupabaseClient()
+        seed_database(db)
+    else:
+        print("⚠ Skipping database seed: no DB DSN configured (REST-only mode detected).")
     print("\n2. Seeding Weaviate...")
     seed_weaviate(kb)
     print("\n✅ Knowledge Base seeded successfully!")

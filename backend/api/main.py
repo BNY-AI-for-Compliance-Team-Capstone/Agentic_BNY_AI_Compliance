@@ -6,7 +6,7 @@ from sqlalchemy import text
 
 from backend.api.routes import router
 from backend.config.settings import settings
-from backend.knowledge_base.postgres_client import PostgreSQLClient
+from backend.knowledge_base.supabase_client import SupabaseClient
 from backend.knowledge_base.weaviate_client import WeaviateClient
 
 app = FastAPI(
@@ -26,9 +26,9 @@ app.add_middleware(
 app.include_router(router, prefix="/api/v1")
 
 
-def check_postgres_connection() -> bool:
+def check_database_connection() -> bool:
     try:
-        db = PostgreSQLClient()
+        db = SupabaseClient()
         with db.engine.connect() as conn:
             conn.execute(text("SELECT 1"))
         return True
@@ -54,10 +54,11 @@ def check_redis_connection() -> bool:
 
 @app.get("/health")
 async def health_check() -> dict:
+    database_ok = check_database_connection()
     return {
         "status": "healthy",
         "services": {
-            "postgres": check_postgres_connection(),
+            "database": database_ok,
             "weaviate": check_weaviate_connection(),
             "redis": check_redis_connection(),
         },

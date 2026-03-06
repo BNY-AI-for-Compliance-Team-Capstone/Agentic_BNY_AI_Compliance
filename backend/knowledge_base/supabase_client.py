@@ -150,14 +150,14 @@ Index("idx_field_mapping_report", FieldMapping.report_type)
 Index("idx_job_status_status", JobStatus.status)
 
 
-class PostgreSQLClient:
+class SupabaseClient:
     def __init__(self, database_url: Optional[str] = None):
-        database_url = database_url or settings.DATABASE_URL
+        database_url = database_url or settings.get_database_url()
         self.engine = create_engine(database_url, future=True)
         self.SessionLocal = sessionmaker(bind=self.engine, future=True)
         parsed = make_url(database_url)
         logger.debug(
-            "PostgreSQL client configured for user={} host={} db={}",
+            "Supabase client configured for user={} host={} db={}",
             parsed.username,
             parsed.host,
             parsed.database,
@@ -165,7 +165,7 @@ class PostgreSQLClient:
 
     def create_tables(self) -> None:
         Base.metadata.create_all(bind=self.engine)
-        logger.info("PostgreSQL schema created/verified")
+        logger.info("Database schema created/verified")
 
     @contextmanager
     def _session(self):

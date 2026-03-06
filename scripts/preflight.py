@@ -17,9 +17,9 @@ if str(ROOT) not in sys.path:
 from backend.config.settings import settings
 
 
-def _check_postgres() -> Tuple[bool, str]:
+def _check_database() -> Tuple[bool, str]:
     try:
-        engine = create_engine(settings.DATABASE_URL, future=True)
+        engine = create_engine(settings.get_database_url(), future=True)
         with engine.connect() as conn:
             conn.execute(text("SELECT 1"))
         return True, "connected"
@@ -60,7 +60,7 @@ def _check_openai_key() -> Tuple[bool, str]:
 def main() -> int:
     checks = [
         ("Python", True, sys.executable),
-        ("PostgreSQL",) + _check_postgres(),
+        ("Database",) + _check_database(),
         ("Redis",) + _check_redis(),
         ("Weaviate",) + _check_weaviate(),
         ("OPENAI_API_KEY",) + _check_openai_key(),
@@ -71,7 +71,7 @@ def main() -> int:
     for name, ok, detail in checks:
         status = "OK" if ok else "FAIL"
         print(f"- {name}: {status} ({detail})")
-        if not ok and name in {"PostgreSQL", "Redis", "Weaviate", "OPENAI_API_KEY"}:
+        if not ok and name in {"Database", "Redis", "Weaviate", "OPENAI_API_KEY"}:
             has_failure = True
 
     if has_failure:

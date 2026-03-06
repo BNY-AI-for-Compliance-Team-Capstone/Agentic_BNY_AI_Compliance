@@ -7,7 +7,7 @@ from fastapi.responses import FileResponse
 
 from backend.api.schemas import ReportSubmission
 from backend.knowledge_base.kb_manager import KBManager
-from backend.knowledge_base.postgres_client import PostgreSQLClient
+from backend.knowledge_base.supabase_client import SupabaseClient
 from backend.orchestration.crew import create_compliance_crew
 from backend.tools.field_mapper import determine_report_types
 from backend.tools.pdf_tools import CTRReportFiler, SARReportFiler
@@ -16,10 +16,14 @@ router = APIRouter()
 
 
 def run_crew_workflow(job_id: str, transaction_data: dict) -> None:
-    db = PostgreSQLClient()
+    db = SupabaseClient()
+
+    def _stage_callback(agent: str, progress: int) -> None:
+        db.update_job_status(job_id, "processing", current_agent=agent, progress=progress)
+
     try:
         db.update_job_status(job_id, "processing", current_agent="router", progress=5)
-        result = create_compliance_crew(transaction_data)
+        result = create_compliance_crew(transaction_data, on_stage=_stage_callback)
         db.update_job_status(job_id, "completed", result=result, progress=100)
     except Exception as exc:
         db.update_job_status(job_id, "failed", error=str(exc))
@@ -28,16 +32,17 @@ def run_crew_workflow(job_id: str, transaction_data: dict) -> None:
 @router.post("/reports/submit")
 async def submit_report(submission: ReportSubmission, background_tasks: BackgroundTasks):
     job_id = str(uuid.uuid4())
-    db = PostgreSQLClient()
+    db = SupabaseClient()
     db.create_job(job_id=job_id, input_data=submission.transaction_data)
     background_tasks.add_task(run_crew_workflow, job_id, submission.transaction_data)
     return {"job_id": job_id, "status": "submitted", "message": "Report generation started"}
 
 
 @router.get("/reports/{job_id}/status")
-async def get_job_status(job_id: str):
-    db = PostgreSQLClient()
-    job = db.get_job(job_id)
+async def get_job_status(job_id: uuid.UUID):
+    job_id_str = str(job_id)
+    db = SupabaseClient()
+    job = db.get_job(job_id_str)
     if not job:
         raise HTTPException(status_code=404, detail="Job not found")
     report_types = (
@@ -45,7 +50,7 @@ async def get_job_status(job_id: str):
         or []
     )
     return {
-        "job_id": job_id,
+        "job_id": job_id_str,
         "status": job["status"],
         "current_agent": job.get("current_agent"),
         "progress": job.get("progress", 0),
@@ -56,9 +61,10 @@ async def get_job_status(job_id: str):
 
 
 @router.get("/reports/{job_id}/download")
-async def download_report(job_id: str, report_type: str | None = None):
-    db = PostgreSQLClient()
-    job = db.get_job(job_id)
+async def download_report(job_id: uuid.UUID, report_type: str | None = None):
+    job_id_str = str(job_id)
+    db = SupabaseClient()
+    job = db.get_job(job_id_str)
     if not job:
         raise HTTPException(status_code=404, detail="Job not found")
     if job["status"] != "completed":

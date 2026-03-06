@@ -21,15 +21,34 @@ def _get_kb() -> KBManager:
 
 
 @tool("Search Knowledge Base")
-def search_kb_tool(query: str, collection: str = "narratives", filters: Optional[Dict[str, Any]] = None, limit: int = 5) -> str:
-    """Search Weaviate collections for related items."""
+def search_kb_tool(
+    query: str,
+    collection: str = "narratives",
+    limit: int = 5,
+) -> str:
+    """
+    Search Weaviate collections for related items.
+
+    Valid collections: narratives, regulations, definitions.
+    Action Input must be a dictionary with query, collection, and limit.
+    """
     try:
         kb = _get_kb()
-        if collection == "narratives":
-            results = kb.find_similar_narratives(query, activity_type=filters.get("activity_type") if filters else None, top_k=limit)
-        elif collection == "regulations":
-            results = kb.search_regulations(query, regulation_names=filters.get("regulation_name") if filters else None, top_k=limit)
-        elif collection == "definitions":
+        normalized_collection = (collection or "").strip().lower()
+        collection_aliases = {
+            "cases": "narratives",
+            "case": "narratives",
+            "guidance": "regulations",
+            "rules": "regulations",
+            "defs": "definitions",
+        }
+        normalized_collection = collection_aliases.get(normalized_collection, normalized_collection)
+
+        if normalized_collection == "narratives":
+            results = kb.find_similar_narratives(query, activity_type=None, top_k=limit)
+        elif normalized_collection == "regulations":
+            results = kb.search_regulations(query, regulation_names=None, top_k=limit)
+        elif normalized_collection == "definitions":
             results = kb.search_definitions(query, top_k=limit)
         else:
             raise ValueError("Unknown collection %s" % collection)
@@ -41,7 +60,7 @@ def search_kb_tool(query: str, collection: str = "narratives", filters: Optional
 
 @tool("Get Report Schema")
 def get_schema_tool(report_type: str) -> str:
-    """Fetch the JSON schema for a report type from PostgreSQL."""
+    """Fetch the JSON schema for a report type from the database."""
     try:
         kb = _get_kb()
         schema = kb.get_schema(report_type)
@@ -53,7 +72,7 @@ def get_schema_tool(report_type: str) -> str:
 
 @tool("Get Validation Rules")
 def get_validation_rules_tool(report_type: str) -> str:
-    """Fetch validation rules for a report type from PostgreSQL."""
+    """Fetch validation rules for a report type from the database."""
     try:
         kb = _get_kb()
         rules = kb.get_validation_rules(report_type)
@@ -78,7 +97,7 @@ def convert_to_narrative_tool(transaction_data: str) -> str:
 
 @tool("Get Field Mappings")
 def get_field_mappings_tool(report_type: str) -> str:
-    """Fetch field mappings for a report type from PostgreSQL."""
+    """Fetch field mappings for a report type from the database."""
     try:
         kb = _get_kb()
         mappings = kb.get_field_mappings(report_type)

@@ -31,29 +31,26 @@ def create_router_agent(llm: LLM, tools: list) -> Agent:
 def create_router_task(agent: Agent, transaction_data: dict) -> Task:
     return Task(
         description=f"""
-        Analyze the following transaction data and determine the appropriate compliance report type.
+        Analyze the following transaction data and classify filing requirement.
 
         Transaction Data:
         {json.dumps(transaction_data, indent=2)}
 
-        Steps:
-        1. If the data is structured (JSON), use the "Convert Structured Data to Narrative" tool to create a narrative description
-        2. Use the "Search Knowledge Base" tool to find similar cases
-        3. Analyze the transaction pattern
-        4. Determine filing requirement:
-           - SAR (Suspicious Activity Report): suspicious patterns present
-           - CTR (Currency Transaction Report): cash transactions >= $10,000
-           - BOTH: if both CTR and SAR conditions are met
-           - NONE: if neither condition is met
-        5. Check if we have the schema using "Get Report Schema"
+        Output a JSON object with:
+        - report_types: ["SAR"], ["CTR"], ["CTR","SAR"], or []
+        - confidence_score: float between 0 and 1
+        - total_cash_amount: float
+        - reasoning: concise factual explanation
+        - kb_status: "EXISTS" or "MISSING"
+        - narrative_description: 2-4 factual sentences
 
-        Provide:
-        - Report type(s): ["SAR"], ["CTR"], ["CTR","SAR"], or []
-        - Confidence score (0.0-1.0)
-        - Total cash amount
-        - Brief reasoning
-        - KB status (EXISTS or MISSING)
-        - Narrative description
+        Classification policy:
+        - SAR when suspicious activity indicators exist
+        - CTR when total cash activity >= 10,000
+        - BOTH when both conditions apply
+        - [] when neither applies
+
+        Return JSON only.
         """,
         expected_output="""{
 "report_types": ["CTR", "SAR"],

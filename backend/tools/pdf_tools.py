@@ -5,12 +5,13 @@ from __future__ import annotations
 import json
 import os
 import uuid
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Tuple
 
 from loguru import logger
 from pypdf import PdfReader, PdfWriter
+from pypdf.generic import BooleanObject, DictionaryObject, NameObject
 
 from backend.tools.field_mapper import CTRFieldMapper, SARFieldMapper, normalize_case_data
 
@@ -28,7 +29,8 @@ except Exception:
         return _decorator
 
 
-SAR_TEMPLATE_PATH = Path("knowledge_base/documents/pdf_templates/sar_report.pdf")
+SAR_TEMPLATE_PATH = Path("knowledge_base/documents/pdf_templates/fincen_sar_form_acroform.pdf")
+SAR_TEMPLATE_FALLBACK_PATH = Path("knowledge_base/documents/pdf_templates/sar_report.pdf")
 CTR_TEMPLATE_PATH = Path("knowledge_base/documents/pdf_templates/ctr_report.pdf")
 OUTPUT_DIR = Path("data/output")
 
@@ -67,8 +69,12 @@ class BaseReportFiler:
         reader = PdfReader(str(self.template_path))
         writer = PdfWriter()
         writer.clone_reader_document_root(reader)
-        for page in reader.pages:
-            writer.add_page(page)
+        # clone_reader_document_root() already carries the page tree for fillable
+        # templates. Adding pages again duplicates every page in output PDFs.
+        if len(writer.pages) == 0:
+            for page in reader.pages:
+                writer.add_page(page)
+        self._ensure_need_appearances(writer)
         page_fields = [self._collect_page_fields(page) for page in writer.pages]
 
         filled = 0
@@ -89,7 +95,7 @@ class BaseReportFiler:
                     continue
             try:
                 writer.update_page_form_field_values(
-                    writer.pages[page_idx], {field_id: str(value)}
+                    writer.pages[page_idx], {field_id: str(value)}, auto_regenerate=True
                 )
                 filled += 1
             except Exception as exc:
@@ -100,6 +106,31 @@ class BaseReportFiler:
         with open(out_path, "wb") as handle:
             writer.write(handle)
         return filled, errors
+
+    def _template_field_count(self) -> int:
+        try:
+            return len(PdfReader(str(self.template_path)).get_fields() or {})
+        except Exception:
+            return 0
+
+    @staticmethod
+    def _ensure_need_appearances(writer: PdfWriter) -> None:
+        """
+        Ensure viewers regenerate field appearances so filled values are visible.
+        """
+        try:
+            root = writer._root_object
+            acro_form = root.get("/AcroForm")
+            if acro_form is None:
+                acro_form = DictionaryObject()
+                root[NameObject("/AcroForm")] = acro_form
+            elif hasattr(acro_form, "get_object"):
+                acro_form = acro_form.get_object()
+            acro_form[NameObject("/NeedAppearances")] = BooleanObject(True)
+            if "/AcroForm" not in root:
+                root[NameObject("/AcroForm")] = acro_form
+        except Exception as exc:
+            logger.debug("Could not set NeedAppearances: {}", exc)
 
     @staticmethod
     def _collect_page_fields(page) -> set[str]:
@@ -134,9 +165,9 @@ class BaseReportFiler:
 
     def _audit_log(self, result: Dict) -> None:
         try:
-            from backend.knowledge_base.postgres_client import PostgreSQLClient
+            from backend.knowledge_base.supabase_client import SupabaseClient
 
-            db = PostgreSQLClient()
+            db = SupabaseClient()
             session_id = uuid.uuid4()
             try:
                 session_id = uuid.UUID(result["report_id"])
@@ -163,6 +194,8 @@ class SARReportFiler(BaseReportFiler):
     """Load case data, map SAR fields, and write a filled SAR PDF."""
 
     REPORT_TYPE = "SAR"
+    LEGACY_VARIANT = "legacy"
+    FINCEN_ACROFORM_VARIANT = "fincen_acroform"
     PAGE2_PREFIXES = (
         "item33",
         "item34",
@@ -185,9 +218,81 @@ class SARReportFiler(BaseReportFiler):
         "37-3",
     )
     PAGE3_FIELDS = {"item51"}
+    AUTO_TEMPLATE_PATHS = (SAR_TEMPLATE_PATH, SAR_TEMPLATE_FALLBACK_PATH)
 
     def __init__(self, template_path: str = str(SAR_TEMPLATE_PATH), output_dir: str = str(OUTPUT_DIR)):
+        # Backward-compatible fallback for environments that still use the older template name.
+        self.auto_select_template = template_path == str(SAR_TEMPLATE_PATH)
+        if template_path == str(SAR_TEMPLATE_PATH) and not Path(template_path).exists() and SAR_TEMPLATE_FALLBACK_PATH.exists():
+            template_path = str(SAR_TEMPLATE_FALLBACK_PATH)
         super().__init__(template_path=template_path, output_dir=output_dir)
+        self.template_variant = self._detect_template_variant()
+
+    def _detect_template_variant(self) -> str:
+        try:
+            fields = PdfReader(str(self.template_path)).get_fields() or {}
+            field_names = set(fields.keys())
+        except Exception:
+            return self.LEGACY_VARIANT
+
+        if (
+            "3  Individuals last name or entitys legal name a Unk" in field_names
+            or "Narrative" in field_names
+        ):
+            return self.FINCEN_ACROFORM_VARIANT
+
+        if any(name.startswith("item") for name in field_names):
+            return self.LEGACY_VARIANT
+
+        return self.LEGACY_VARIANT
+
+    def _field_names_for_template(self, template_path: Path) -> set[str]:
+        try:
+            return set((PdfReader(str(template_path)).get_fields() or {}).keys())
+        except Exception:
+            return set()
+
+    def _build_field_values(
+        self,
+        normalized_case: Dict[str, Any],
+        template_variant: str,
+        injected_narrative: str | None = None,
+    ) -> Dict[str, str]:
+        mapper = SARFieldMapper(normalized_case)
+        field_values = mapper.map_all_fields(template_variant=template_variant)
+        if injected_narrative:
+            narrative_field_id = (
+                "Narrative" if template_variant == self.FINCEN_ACROFORM_VARIANT else "item51"
+            )
+            field_values[narrative_field_id] = injected_narrative[:4000]
+        return field_values
+
+    def _choose_best_template(
+        self,
+        normalized_case: Dict[str, Any],
+        injected_narrative: str | None = None,
+    ) -> tuple[Path, str, Dict[str, str]]:
+        candidates: List[Path] = []
+        for path in self.AUTO_TEMPLATE_PATHS:
+            if path.exists():
+                candidates.append(path)
+        if not candidates:
+            variant = self._detect_template_variant()
+            return self.template_path, variant, self._build_field_values(normalized_case, variant, injected_narrative)
+
+        best: tuple[int, Path, str, Dict[str, str]] | None = None
+        for candidate in candidates:
+            self.template_path = candidate
+            variant = self._detect_template_variant()
+            fields = self._build_field_values(normalized_case, variant, injected_narrative)
+            template_field_names = self._field_names_for_template(candidate)
+            score = sum(1 for field_id in fields if field_id in template_field_names)
+            if best is None or score > best[0]:
+                best = (score, candidate, variant, fields)
+
+        assert best is not None
+        _, chosen_path, chosen_variant, chosen_fields = best
+        return chosen_path, chosen_variant, chosen_fields
 
     def fill_from_dict(self, case_data: Any, injected_narrative: str | None = None) -> Dict:
         normalized_case = normalize_case_data(case_data)
@@ -197,12 +302,18 @@ class SARReportFiler(BaseReportFiler):
         out_path = self.output_dir / out_name
         logger.info("Filling SAR PDF for case {}", case_id)
 
-        mapper = SARFieldMapper(normalized_case)
-        field_values = mapper.map_all_fields()
-        if injected_narrative:
-            field_values["item51"] = injected_narrative[:4000]
+        if self.auto_select_template:
+            selected_template, selected_variant, field_values = self._choose_best_template(
+                normalized_case, injected_narrative
+            )
+            self.template_path = selected_template
+            self.template_variant = selected_variant
+        else:
+            field_values = self._build_field_values(normalized_case, self.template_variant, injected_narrative)
 
         filled_count, errors = self._fill_pdf(field_values, out_path)
+        template_field_count = self._template_field_count()
+        attempted_fields = len(field_values)
         result = {
             "status": "success",
             "report_id": report_id,
@@ -210,8 +321,12 @@ class SARReportFiler(BaseReportFiler):
             "report_type": "SAR",
             "pdf_path": str(out_path),
             "fields_filled": filled_count,
+            "attempted_fields": attempted_fields,
+            "template_field_count": template_field_count,
             "fill_errors": errors,
-            "generated_at": datetime.utcnow().isoformat() + "Z",
+            "template_path": str(self.template_path),
+            "template_variant": self.template_variant,
+            "generated_at": datetime.now(timezone.utc).isoformat(),
         }
         self._audit_log(result)
         logger.info(
@@ -247,6 +362,8 @@ class CTRReportFiler(BaseReportFiler):
         field_values = mapper.map_all_fields()
 
         filled_count, errors = self._fill_pdf(field_values, out_path)
+        template_field_count = self._template_field_count()
+        attempted_fields = len(field_values)
         result = {
             "status": "success",
             "report_id": report_id,
@@ -254,8 +371,10 @@ class CTRReportFiler(BaseReportFiler):
             "report_type": "CTR",
             "pdf_path": str(out_path),
             "fields_filled": filled_count,
+            "attempted_fields": attempted_fields,
+            "template_field_count": template_field_count,
             "fill_errors": errors,
-            "generated_at": datetime.utcnow().isoformat() + "Z",
+            "generated_at": datetime.now(timezone.utc).isoformat(),
         }
         self._audit_log(result)
         logger.info(
