@@ -9,6 +9,7 @@ All logic and UI live in router_agent; no changes to backend or main Streamlit a
 from __future__ import annotations
 
 import ast
+import copy
 import json
 import sys
 from pathlib import Path
@@ -23,6 +24,19 @@ import streamlit as st
 
 from router_agent import run_router, RouterResult
 from router_agent.config import API_BASE_URL
+
+
+def _set_nested(payload: dict, path: str, value: str) -> None:
+    """Set payload at dot path (e.g. subject.first_name). Creates nested dicts as needed."""
+    if not path.strip():
+        return
+    parts = path.split(".")
+    current = payload
+    for i, key in enumerate(parts[:-1]):
+        if key not in current or not isinstance(current[key], dict):
+            current[key] = {}
+        current = current[key]
+    current[parts[-1]] = value
 
 
 def _submit_to_backend(payload: dict, base_url: str | None = None) -> tuple[bool, str]:
@@ -47,7 +61,7 @@ def _submit_to_backend(payload: dict, base_url: str | None = None) -> tuple[bool
         return False, str(e)
 
 
-def _render_router_result(result: RouterResult) -> None:
+def _render_router_result(result: RouterResult, payload: dict) -> None:
     st.subheader("Router result")
     st.table(
         [
@@ -59,11 +73,45 @@ def _render_router_result(result: RouterResult) -> None:
         ]
     )
     st.markdown("**Message**")
-    st.info(result.message)
     if result.missing_fields:
-        st.warning(f"Missing required fields ({len(result.missing_fields)}): {', '.join(result.missing_fields)}")
+        st.info(result.message)
+        with st.expander(f"Show missing required fields ({len(result.missing_fields)})"):
+            st.code(", ".join(result.missing_fields), language=None)
+        # Multi-turn: ask for each missing field using ask_user_prompt
+        if result.missing_field_prompts:
+            st.markdown("---")
+            st.markdown("#### Provide missing information")
+            st.caption("Answer each prompt below; then click **Submit answers & re-validate** until all required fields are filled.")
+            merged = copy.deepcopy(payload)
+            for p in result.missing_field_prompts:
+                key = p.get("input_key", "")
+                label = p.get("ask_user_prompt") or p.get("field_label") or key
+                ui_key = f"missing_{key.replace('.', '_')}"
+                val = st.text_input(label, key=ui_key, placeholder=f"Value for {key}")
+                _set_nested(merged, key, str(val).strip() if val else "")
+            if st.button("Submit answers & re-validate", key="btn_revalidate"):
+                with st.spinner("Re-validating..."):
+                    new_result = run_router(merged)
+                st.session_state["router_result"] = new_result
+                st.session_state["pending_payload"] = merged
+                st.rerun()
     else:
-        st.success("All required fields present. You can submit to the full pipeline.")
+        st.success(result.message)
+        # Output complete JSON: initial input + all filled required fields (for aggregator/pipeline)
+        st.markdown("---")
+        st.markdown("#### Complete case JSON (for pipeline)")
+        st.caption("Initial input plus all required fields that were filled. Use this JSON for the aggregator agent or downstream pipeline.")
+        json_str = json.dumps(payload, indent=2)
+        st.code(json_str, language="json")
+        case_id = (payload.get("case_id") or "case") if isinstance(payload, dict) else "case"
+        safe_id = "".join(c if c.isalnum() or c in "-_" else "_" for c in str(case_id))[:64]
+        st.download_button(
+            label="Download complete JSON",
+            data=json_str,
+            file_name=f"{safe_id}_complete.json",
+            mime="application/json",
+            key="download_complete_json",
+        )
 
 
 st.set_page_config(page_title="Router Agent – Submit Case", page_icon="📋", layout="centered")
@@ -135,7 +183,7 @@ st.markdown("---")
 st.markdown("### Next: submit to full pipeline")
 
 if st.session_state.get("router_result") and st.session_state.get("pending_payload"):
-    _render_router_result(st.session_state["router_result"])
+    _render_router_result(st.session_state["router_result"], st.session_state["pending_payload"])
     payload = st.session_state["pending_payload"]
     base = st.session_state.get("backend_url", API_BASE_URL) or API_BASE_URL
     if st.button("Submit to full pipeline", type="primary", key="submit_full"):

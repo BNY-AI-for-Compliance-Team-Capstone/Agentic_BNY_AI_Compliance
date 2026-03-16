@@ -99,6 +99,24 @@ def get_required_input_keys(report_type_code: str) -> List[str]:
     return sorted(set(out))
 
 
+def get_required_fields_with_prompts(report_type_code: str) -> List[Dict[str, Any]]:
+    """
+    Return required fields (is_required=true) with ask_user_prompt and field_label
+    for multi-turn collection of missing values. Each item: input_key, ask_user_prompt, field_label.
+    """
+    rows = fetch_required_fields(report_type_code, required_only=True)
+    out = []
+    for r in rows:
+        if not isinstance(r, dict) or not r.get("input_key"):
+            continue
+        out.append({
+            "input_key": str(r["input_key"]).strip(),
+            "ask_user_prompt": str(r.get("ask_user_prompt") or "").strip() or r.get("field_label") or r["input_key"],
+            "field_label": str(r.get("field_label") or r["input_key"]).strip(),
+        })
+    return out
+
+
 def get_report_type_schema(report_type_code: str) -> Optional[Dict[str, Any]]:
     """
     Return json_schema from report_types for this report_type_code, or None if not found.

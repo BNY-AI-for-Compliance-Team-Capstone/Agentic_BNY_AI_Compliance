@@ -73,20 +73,28 @@ def get_report_schema(report_type: str) -> Dict[str, Any]:
 def get_required_field_paths(report_type: str) -> List[str]:
     """
     Return required field paths for this report type for validation.
-    - When Supabase REST is enabled: uses required_fields table (input_key where is_required=true).
+    - When Supabase REST is enabled: uses only required_fields table where is_required=TRUE
+      (no schema fallback, so the form's required_fields is the single source of truth).
     - Otherwise: uses report schema (from KBManager) and schema_validator to derive paths.
     """
     if not (report_type and str(report_type).strip()):
         return []
     rt = str(report_type).strip().upper()
     if _use_supabase_rest():
-        paths = supabase_rest.get_required_input_keys(rt)
-        if paths:
-            return paths
-        # Fallback: derive from json_schema in report_types if required_fields is empty
-        schema = supabase_rest.get_report_type_schema(rt)
-        if schema:
-            return schema_required_paths(schema, rt)
-        return []  # no required_fields rows and no json_schema
+        return supabase_rest.get_required_input_keys(rt)
     schema = get_report_schema(rt)
     return schema_required_paths(schema, rt)
+
+
+def get_required_fields_with_prompts(report_type: str) -> List[Dict[str, Any]]:
+    """
+    Return required fields with ask_user_prompt for multi-turn collection (is_required=TRUE only).
+    When Supabase is enabled: from required_fields table. Otherwise: empty list.
+    Each item: input_key, ask_user_prompt, field_label.
+    """
+    if not (report_type and str(report_type).strip()):
+        return []
+    rt = str(report_type).strip().upper()
+    if _use_supabase_rest():
+        return supabase_rest.get_required_fields_with_prompts(rt)
+    return []

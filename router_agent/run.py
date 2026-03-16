@@ -12,7 +12,11 @@ from typing import Any, Dict, List, Union
 from loguru import logger
 
 from router_agent.agent import classify_report_type
-from router_agent.kb_client import get_required_field_paths, report_type_exists
+from router_agent.kb_client import (
+    get_required_field_paths,
+    get_required_fields_with_prompts,
+    report_type_exists,
+)
 from router_agent.schema_validator import (
     get_missing_required_fields,
     normalize_input_to_single_case,
@@ -27,6 +31,7 @@ class RouterResult:
     kb_status: str  # "EXISTS" | "MISSING"
     validated_input: Dict[str, Any]
     missing_fields: List[str] = field(default_factory=list)
+    missing_field_prompts: List[Dict[str, Any]] = field(default_factory=list)  # input_key, ask_user_prompt, field_label
     message: str = ""
     confidence_score: float = 0.0
     reasoning: str = ""
@@ -40,6 +45,7 @@ class RouterResult:
             "kb_status": self.kb_status,
             "validated_input": self.validated_input,
             "missing_fields": self.missing_fields,
+            "missing_field_prompts": self.missing_field_prompts,
             "message": self.message,
             "confidence_score": self.confidence_score,
             "reasoning": self.reasoning,
@@ -133,6 +139,15 @@ def run_router(
             reasoning=reasoning,
         )
 
+    # Build prompts for missing fields (from required_fields.ask_user_prompt when Supabase is used)
+    def _prompts_for_missing(missing: List[str], report_ty: str) -> List[Dict[str, Any]]:
+        meta = get_required_fields_with_prompts(report_ty)
+        by_key = {m["input_key"]: m for m in meta}
+        return [
+            by_key.get(path, {"input_key": path, "ask_user_prompt": f"Please provide value for {path}", "field_label": path})
+            for path in missing
+        ]
+
     # --- 4. Validate input ---
     if isinstance(user_input, dict):
         case_data = normalize_input_to_single_case(user_input)
@@ -153,6 +168,7 @@ def run_router(
             kb_status="EXISTS",
             validated_input=case_data,
             missing_fields=missing_fields,
+            missing_field_prompts=_prompts_for_missing(missing_fields, schema_lookup_type),
             message=message,
             confidence_score=confidence_score,
             reasoning=reasoning,
@@ -165,8 +181,10 @@ def run_router(
             f"Report type '{report_type}' is supported. The following required fields are missing or empty: {', '.join(missing_fields)}. "
             "Please provide these details before submitting to the pipeline."
         )
+        missing_field_prompts = _prompts_for_missing(missing_fields, schema_lookup_type)
     else:
         message = f"Report type '{report_type}' confirmed. All required fields are present. Ready for the rest of the pipeline."
+        missing_field_prompts = []
 
     return RouterResult(
         report_type=report_type,
@@ -174,6 +192,7 @@ def run_router(
         kb_status="EXISTS",
         validated_input=case_data,
         missing_fields=missing_fields,
+        missing_field_prompts=missing_field_prompts,
         message=message,
         confidence_score=confidence_score,
         reasoning=reasoning,
