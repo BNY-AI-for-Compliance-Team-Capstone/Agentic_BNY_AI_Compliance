@@ -1,4 +1,5 @@
 # SAR Narrative Generator Agent - CrewAI
+python-dotenv>=1.0.0
 crewai>=0.80.0
 crewai[openai]>=0.80.0
 pydantic>=2.0.0

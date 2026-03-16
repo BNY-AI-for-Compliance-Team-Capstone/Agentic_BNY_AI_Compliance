@@ -36,6 +36,24 @@ def test_validate_input_missing_suspicious_activity():
         validate_input({"case_id": "C-1", "subject": {}})
 
 
+def test_validate_input_ofac_reject_ok():
+    data = {
+        "case_id": "OFAC-SYN-001",
+        "report_type_code": "OFAC_REJECT",
+        "transaction": {"amount_rejected": "18450.00", "currency": "USD"},
+        "case_facts": {"disposition": "Rejected — transaction not processed"},
+    }
+    assert validate_input(data, report_type_code="OFAC_REJECT") == data
+
+
+def test_validate_input_ofac_reject_missing_transaction():
+    with pytest.raises(ValueError, match="transaction"):
+        validate_input(
+            {"case_id": "OFAC-1", "case_facts": {}},
+            report_type_code="OFAC_REJECT",
+        )
+
+
 def test_validate_output_ok():
     out = validate_output({"narrative": "Factual narrative text."})
     assert out.narrative == "Factual narrative text."

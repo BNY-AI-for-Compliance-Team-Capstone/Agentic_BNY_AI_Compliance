@@ -140,3 +140,15 @@ def test_build_narrative_guidance_context_returns_supabase_content(
     assert "Example one" in examples
     mock_fetch_config.assert_called_once_with("SAR")
     mock_fetch_examples.assert_called_once_with("SAR")
+
+
+@patch("narrative_agent.knowledge_base.fetch_report_type_config")
+def test_build_narrative_guidance_context_ofac_reject_fallback(mock_fetch_config):
+    """When KB has no row for OFAC_REJECT, local fallback returns instructions and examples."""
+    mock_fetch_config.side_effect = KnowledgeBaseError(
+        "No active narrative-enabled report_type found for code='OFAC_REJECT'."
+    )
+    instructions, examples = build_narrative_guidance_context("OFAC_REJECT")
+    assert "Sanctions Rejected Transaction" in instructions or "rejected" in instructions.lower()
+    assert "rejected" in examples.lower() or "not processed" in examples.lower()
+    mock_fetch_config.assert_called_once_with("OFAC_REJECT")

@@ -1,7 +1,6 @@
 """
-CrewAI Narrative Generator Agent for regulatory narratives (e.g., SAR).
-Generates the narrative section from suspicious activity input without hallucination.
-Now supports pulling narrative instructions and examples from a Supabase knowledge base.
+CrewAI Narrative Generator Agent for regulatory narratives (SAR, OFAC_REJECT, etc.).
+Generates the narrative section from structured input using KB-retrieved or local guidance.
 """
 
 import json
@@ -10,13 +9,11 @@ from typing import Any
 
 from crewai import Agent, Crew, LLM, Process, Task
 
-# Fallback (restore if needed): local examples and reference for when KB is unavailable.
-# from narrative_agent.examples import get_few_shot_text
-# from narrative_agent.narrative_reference import get_reference_context
 from narrative_agent.knowledge_base import (
     KnowledgeBaseError,
     build_narrative_guidance_context,
 )
+from narrative_agent.report_types import get_report_type_from_input, get_report_type_spec
 from narrative_agent.schemas import NarrativeOutput, validate_input
 
 
@@ -24,27 +21,15 @@ def _build_task_description(
     input_json: dict[str, Any],
     report_type_code: str = "SAR",
 ) -> str:
-    """Build the task description from the Supabase knowledge base only.
+    """Build the task description from KB (or local fallback) for the given report type.
 
-    Narrative instructions and examples are always fetched from the Supabase
-    report_types and narrative_examples tables for the given report_type_code.
-    No fallback to local few-shot or reference content; if the KB is unavailable,
-    KnowledgeBaseError is raised.
+    Retrieves narrative instructions and examples for report_type_code, then
+    injects the structured input. Used by create_crew for the task description.
     """
+    spec = get_report_type_spec(report_type_code)
     instructions_text, examples_text = build_narrative_guidance_context(
         report_type_code
     )
-    # Fallback (restore if needed): use local reference and few-shot on KB failure.
-    # reference = get_reference_context()
-    # few_shot = get_few_shot_text()
-    # try:
-    #     instructions_text, examples_text = build_narrative_guidance_context(report_type_code)
-    #     if instructions_text:
-    #         reference = instructions_text
-    #     if examples_text:
-    #         few_shot = examples_text
-    # except (KnowledgeBaseError, Exception):
-    #     pass
     reference = instructions_text or ""
     few_shot = examples_text or ""
 
@@ -59,7 +44,7 @@ Few-shot examples and reference narratives. Follow this style and use ONLY facts
 
 ---
 
-Current input (suspicious activity information) — use ONLY this data to write the narrative:
+Current input ({spec.prompt_input_label}) — use ONLY this data to write the narrative:
 
 {input_str}
 
@@ -89,28 +74,27 @@ def create_crew(
 
     Args:
         input_json: Full input JSON for narrative generation.
-        report_type_code: Code for the report type (e.g., "SAR"). Used to
-            fetch narrative instructions and examples from the knowledge base.
+        report_type_code: Code for the report type (e.g., "SAR", "OFAC_REJECT").
+            Used to fetch narrative instructions and examples from the knowledge base
+            (or local fallback) and to set agent role/goal/backstory.
         verbose: Whether to print CrewAI execution logs.
     """
+    spec = get_report_type_spec(report_type_code)
     llm = LLM(
         model="openai/gpt-4o-mini",
         temperature=0.2,
         max_tokens=2000,
     )
     agent = Agent(
-        role="SAR Narrative Writer",
-        goal="Write accurate, factual SAR narratives using only the provided suspicious activity data. Never invent or assume facts.",
-        backstory=(
-            "You are a compliance analyst who drafts SAR narrative sections. "
-            "You strictly use only the information given in the input. You never add names, dates, amounts, or events that are not explicitly in the data."
-        ),
+        role=spec.agent_role,
+        goal=spec.agent_goal,
+        backstory=spec.agent_backstory,
         llm=llm,
         verbose=verbose,
     )
     task = Task(
         description=_build_task_description(input_json, report_type_code=report_type_code),
-        expected_output="A JSON object with a single key 'narrative' containing the SAR narrative paragraph. No other text.",
+        expected_output=f"A JSON object with a single key 'narrative' containing the {spec.expected_output_hint}. No other text.",
         agent=agent,
     )
     return Crew(
@@ -120,24 +104,27 @@ def create_crew(
 
 def generate_narrative(
     input_data: dict[str, Any],
-    report_type_code: str = "SAR",
+    report_type_code: str | None = None,
     *,
     verbose: bool = True,
 ) -> dict[str, Any]:
     """
-    Generate SAR narrative from suspicious activity input.
+    Generate narrative from structured input. Report type routes to the correct
+    KB retrieval and generation flow.
 
     Args:
-        input_data: Full SAR input JSON (case_id, subject, alert, SuspiciousActivityInformation, transactions, etc.).
-        report_type_code: Report type code (e.g., "SAR"). Determines which
-            narrative instructions and examples to load from the knowledge base.
+        input_data: Full input JSON. For SAR: case_id, subject, SuspiciousActivityInformation, etc.
+            For OFAC_REJECT: case_id, transaction, case_facts, etc. May include report_type_code.
+        report_type_code: Report type (e.g., "SAR", "OFAC_REJECT"). If None, read from
+            input_data["report_type_code"] or input_data["report_type"] (default "SAR").
         verbose: Whether to print CrewAI execution logs.
 
     Returns:
-        Same structure as input with one additional key "narrative" (str). The returned dict
-        contains all keys from input_data plus "narrative".
+        Same structure as input with one additional key "narrative" (str).
     """
-    validate_input(input_data)
+    if report_type_code is None:
+        report_type_code = get_report_type_from_input(input_data)
+    validate_input(input_data, report_type_code=report_type_code)
     crew = create_crew(input_data, report_type_code=report_type_code, verbose=verbose)
     result = crew.kickoff()
     # CrewAI returns CrewOutput; get last task's raw output

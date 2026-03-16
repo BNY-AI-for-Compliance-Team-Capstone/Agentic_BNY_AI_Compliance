@@ -50,6 +50,24 @@ def test_create_crew_returns_crew(mock_kb):
 
 
 @patch("narrative_agent.agent.build_narrative_guidance_context")
+@patch.dict("os.environ", {"OPENAI_API_KEY": "sk-test-dummy"}, clear=False)
+def test_create_crew_ofac_reject_uses_spec(mock_kb):
+    """OFAC_REJECT crew uses agent role/goal from report type spec."""
+    mock_kb.return_value = ("OFAC instructions", "OFAC examples")
+    input_json = {
+        "case_id": "OFAC-001",
+        "transaction": {},
+        "case_facts": {},
+    }
+    crew = create_crew(input_json, report_type_code="OFAC_REJECT", verbose=False)
+    assert crew is not None
+    assert len(crew.agents) == 1
+    agent = crew.agents[0]
+    assert "OFAC" in agent.role
+    mock_kb.assert_called_once_with("OFAC_REJECT")
+
+
+@patch("narrative_agent.agent.build_narrative_guidance_context")
 @patch("narrative_agent.agent.create_crew")
 def test_generate_narrative_mocked_crew(mock_create_crew, mock_kb):
     input_data = {
@@ -78,6 +96,32 @@ def test_generate_narrative_mocked_crew(mock_create_crew, mock_kb):
         input_data, report_type_code="SAR", verbose=False
     )
     mock_crew.kickoff.assert_called_once()
+
+
+@patch("narrative_agent.agent.build_narrative_guidance_context")
+@patch("narrative_agent.agent.create_crew")
+def test_generate_narrative_ofac_reject_routing(mock_create_crew, mock_kb):
+    """OFAC_REJECT: report_type_code from input routes to correct KB and crew."""
+    input_data = {
+        "case_id": "OFAC-SYN-001",
+        "report_type_code": "OFAC_REJECT",
+        "transaction": {"amount_rejected": "18450.00", "currency": "USD"},
+        "case_facts": {"disposition": "Rejected — transaction not processed"},
+    }
+    mock_kb.return_value = ("OFAC instructions", "OFAC examples")
+    mock_result = MagicMock()
+    mock_result.tasks_output = [MagicMock(raw='{"narrative": "First National Bank rejected the wire. Transaction was not processed."}')]
+    mock_crew = MagicMock()
+    mock_crew.kickoff.return_value = mock_result
+    mock_create_crew.return_value = mock_crew
+
+    result = generate_narrative(input_data, verbose=False)
+
+    assert result["narrative"] == "First National Bank rejected the wire. Transaction was not processed."
+    assert result["case_id"] == "OFAC-SYN-001"
+    mock_create_crew.assert_called_once_with(
+        input_data, report_type_code="OFAC_REJECT", verbose=False
+    )
 
 
 def test_generate_narrative_validates_input():

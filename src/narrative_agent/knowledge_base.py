@@ -20,6 +20,8 @@ from typing import Any, List, Optional
 
 import requests
 
+from narrative_agent.report_types import get_report_type_spec, has_local_fallback
+
 
 class KnowledgeBaseError(RuntimeError):
     """Raised when the Supabase knowledge base cannot be reached or used."""
@@ -147,44 +149,55 @@ def fetch_narrative_examples(report_type_code: str) -> list[NarrativeExample]:
     return examples
 
 
+def _get_local_guidance(report_type_code: str) -> tuple[str, str]:
+    """Return (instructions_text, examples_text) from the report type registry (local fallback)."""
+    spec = get_report_type_spec(report_type_code)
+    instructions_text = spec.local_instructions or ""
+    examples_text = spec.local_examples_text or ""
+    return instructions_text, examples_text
+
+
 def build_narrative_guidance_context(
     report_type_code: str,
 ) -> tuple[str, str]:
     """Return (instructions_text, examples_text) for a given report type.
 
-    instructions_text comes from report_types.narrative_instructions and any
-    narrative guidance found in the JSON schema (e.g., part_V.narrative_guidance).
-
-    examples_text comes from narrative_examples (summary + narrative_text +
-    effectiveness_notes), formatted for use in an LLM system prompt.
+    Tries Supabase first (report_types.narrative_instructions + narrative_examples).
+    If the KB has no row for this report type and the type has local fallback
+    (e.g. OFAC_REJECT), returns local guidance so retrieval + generation
+    still works without Supabase.
     """
-    cfg = fetch_report_type_config(report_type_code)
-    instructions_lines: list[str] = []
-    if cfg.narrative_instructions:
-        instructions_lines.append(cfg.narrative_instructions.strip())
+    try:
+        cfg = fetch_report_type_config(report_type_code)
+        instructions_lines: list[str] = []
+        if cfg.narrative_instructions:
+            instructions_lines.append(cfg.narrative_instructions.strip())
 
-    # Optionally add structured narrative guidance from the JSON schema, if present.
-    schema = cfg.json_schema or {}
-    part_v = schema.get("part_V") or {}
-    narrative_guidance = part_v.get("narrative_guidance") or []
-    if narrative_guidance:
-        instructions_lines.append("Additional narrative guidance from the schema:")
-        for item in narrative_guidance:
-            instructions_lines.append(f"- {item}")
+        schema = cfg.json_schema or {}
+        part_v = schema.get("part_V") or {}
+        narrative_guidance = part_v.get("narrative_guidance") or []
+        if narrative_guidance:
+            instructions_lines.append("Additional narrative guidance from the schema:")
+            for item in narrative_guidance:
+                instructions_lines.append(f"- {item}")
 
-    instructions_text = "\n\n".join(instructions_lines).strip()
+        instructions_text = "\n\n".join(instructions_lines).strip()
 
-    examples = fetch_narrative_examples(report_type_code)
-    example_lines: list[str] = []
-    for i, ex in enumerate(examples, 1):
-        example_lines.append(f"--- Example {i} ({ex.summary}) ---")
-        example_lines.append("Example narrative text:")
-        example_lines.append(ex.narrative_text.strip())
-        if ex.effectiveness_notes:
-            example_lines.append("Why this example is effective:")
-            example_lines.append(ex.effectiveness_notes.strip())
-        example_lines.append("")
+        examples = fetch_narrative_examples(report_type_code)
+        example_lines: list[str] = []
+        for i, ex in enumerate(examples, 1):
+            example_lines.append(f"--- Example {i} ({ex.summary}) ---")
+            example_lines.append("Example narrative text:")
+            example_lines.append(ex.narrative_text.strip())
+            if ex.effectiveness_notes:
+                example_lines.append("Why this example is effective:")
+                example_lines.append(ex.effectiveness_notes.strip())
+            example_lines.append("")
 
-    examples_text = "\n".join(example_lines).strip()
-    return instructions_text, examples_text
+        examples_text = "\n".join(example_lines).strip()
+        return instructions_text, examples_text
+    except KnowledgeBaseError:
+        if has_local_fallback(report_type_code):
+            return _get_local_guidance(report_type_code)
+        raise
 

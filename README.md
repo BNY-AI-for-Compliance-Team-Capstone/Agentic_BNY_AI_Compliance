@@ -1,27 +1,33 @@
-## SAR Narrative Generator Agent
+## Narrative Generator Agent (SAR & OFAC Rejected Transaction)
 
-A **CrewAI** agent that generates the mandatory narrative section for Suspicious Activity Reports (SAR) and other report types from structured JSON input. The agent is designed to **not hallucinate**: it uses only the provided input data and follows narrative instructions and examples pulled from a Supabase-hosted knowledge base, with local fallbacks.
+A **CrewAI** agent that generates regulatory narratives from structured JSON input. It supports **SAR** (Suspicious Activity Reports) and **OFAC_REJECT** (sanctions rejected transaction reports) through a single entry point: report type is detected from the input or passed explicitly, then the correct knowledge-base guidance is retrieved and the narrative is generated and validated.
+
+The agent is designed to **not hallucinate**: it uses only the provided input and follows narrative instructions and examples from a Supabase knowledge base (or local fallback for OFAC_REJECT).
 
 ### Features
 
-- **Input**: JSON with case, subject, institution, alert, SuspiciousActivityInformation (FinCEN-style fields), and transactions.
-- **Output**: Same structure as input with one new field `narrative` added (input JSON + `{"narrative": "..."}`).
-- **CrewAI**: One agent (SAR Narrative Writer) with one task; uses OpenAI `gpt-4o-mini` (small model).
-- **Supabase knowledge base**: Uses the `report_types` and `narrative_examples` tables to load narrative instructions, schema-based guidance, and high-quality example narratives by `report_type_code` (e.g., `SAR`).
-- **Local fallbacks**: If Supabase is not configured or unavailable, falls back to built-in effectiveness guidelines and few-shot examples.
-- **Tests**: Pytest for schemas and agent (mocked so no API key needed for unit tests).
-- **Demo**: Jupyter notebook showing full flow from input JSON to generated narrative.
+- **Report types**: **SAR** and **OFAC_REJECT**. Routing by `report_type_code` in the input (or argument); same API for both.
+- **Input**:  
+  - **SAR**: `case_id`, `subject`, `SuspiciousActivityInformation`, plus optional alert, transactions, institution, etc.  
+  - **OFAC_REJECT**: `case_id`, `transaction`, `case_facts`, plus optional institution, preparer, `report_type_code`.
+- **Output**: Same structure as input with one new field `narrative` (input JSON + `{"narrative": "..."}`).
+- **Knowledge base**: Fetches narrative instructions and examples from Supabase `report_types` and `narrative_examples` by `report_type_code`. For **OFAC_REJECT**, if the KB has no row (or Supabase is unavailable), built-in local guidance and an example are used so the flow works without Supabase.
+- **Narrative validation**: Optional checks per report type (structure, tone, completeness). See `validate_narrative()` and `docs/NARRATIVE_VALIDATION.md`; OFAC_REJECT checks include rejection stated, no blocking language, sanctions nexus and documents reviewed.
+- **CrewAI**: One agent per run (role/goal from report type registry); one task; uses OpenAI `gpt-4o-mini`.
+- **Tests**: Pytest for schemas, agent, KB fallback, OFAC_REJECT routing and validation (mocked so no API key needed for unit tests).
+- **Demo**: Jupyter notebook (SAR + OFAC sections) from input JSON → generate → validate → display.
 
 ### Setup
 
+From the project root:
+
 ```bash
-cd narrative_agent
 python -m venv .venv
 source .venv/bin/activate   # or .venv\Scripts\activate on Windows
-pip install -r requirements.txt
+pip install -r requirements.txt   # or pip install -e .
 ```
 
-Set your OpenAI and Supabase environment variables:
+Set your OpenAI and (for SAR) Supabase environment variables:
 
 ```bash
 export OPENAI_API_KEY=sk-...
@@ -38,8 +44,10 @@ The Supabase URL and anon key must have read access to:
 
 From the project root, with `src` on the Python path:
 
+**SAR** (pass `report_type_code` or omit; SAR is default when not in input):
+
 ```bash
-cd narrative_agent
+cd narrative_agent   # or project root
 PYTHONPATH=src python -c "
 from narrative_agent import generate_narrative
 import json
@@ -50,72 +58,97 @@ print(json.dumps(out, indent=2))
 "
 ```
 
+**OFAC rejected transaction** (include `report_type_code` in input or pass it):
+
+```bash
+PYTHONPATH=src python -c "
+from narrative_agent import generate_narrative, validate_narrative
+import json
+with open('examples/ofac_reject_example.json') as f:
+    data = json.load(f)
+out = generate_narrative(data)   # routes by data['report_type_code']
+v = validate_narrative(out['narrative'], out, report_type_code='OFAC_REJECT')
+print('Valid:', v.passed)
+print(out['narrative'][:300], '...')
+"
+```
+
 Or use the class:
 
 ```python
 from narrative_agent import NarrativeGeneratorCrew
 
 crew = NarrativeGeneratorCrew(verbose=True)
-result = crew.kickoff(inputs=<your_sar_input_dict>)
+result = crew.kickoff(inputs=<your_input_dict>)  # SAR or OFAC_REJECT shape
 # result is input JSON + {'narrative': '...'}
 ```
 
-Internally, the agent will:
+Internally, the agent:
 
-- Call Supabase `report_types` for the given `report_type_code` to fetch `narrative_instructions` and any schema-based narrative guidance (e.g., Part V guidelines).
-- Call Supabase `narrative_examples` for the same `report_type_code` to retrieve example narratives and effectiveness notes, which are incorporated into the prompt.
-- Fall back to local examples and guidelines if the knowledge base cannot be reached or is not configured.
+- Resolves `report_type_code` from the input (e.g. `report_type_code` or `report_type`) or the argument; default is `SAR`.
+- Fetches narrative instructions and examples from Supabase `report_types` and `narrative_examples` for that code. For **OFAC_REJECT**, if the KB has no row or Supabase is unavailable, local guidance from the report type registry is used.
+- Builds the prompt from retrieved (or local) instructions, examples, and the full structured input, then generates one narrative paragraph and returns input + `narrative`.
 
 ### Running tests
 
 ```bash
-cd narrative_agent
+cd narrative_agent   # or project root
 PYTHONPATH=src pytest tests/ -v
 ```
 
-Tests exercise schema validation and the agent orchestration. Knowledge base failures (e.g., missing `SUPABASE_URL` / `SUPABASE_ANON_KEY`) automatically fall back to local examples so tests remain deterministic.
+Tests cover schema validation (SAR and OFAC_REJECT required keys), agent orchestration and routing, KB fallback for OFAC_REJECT, and narrative validation. Agent and KB calls are mocked so no API keys are required for unit tests.
 
 ### Jupyter notebook demo
 
 From the project root:
 
 ```bash
-cd narrative_agent
 PYTHONPATH=src jupyter notebook notebooks/sar_narrative_demo.ipynb
 ```
 
-Run all cells. The notebook loads the input example, shows the guidance used in the prompt, runs the agent, and displays the generated narrative in JSON.
+Run all cells. The notebook includes:
+
+- **SAR**: Load example input, run the agent, validate the narrative, display result (Sections 1–7).
+- **OFAC_REJECT** (Section 8): Load `examples/ofac_reject_example.json`, generate narrative (routing by `report_type_code`), validate, and display. Set `OPENAI_API_KEY` before running agent cells.
 
 ### Project structure
 
 ```text
-narrative_agent/
-  requirements.txt
+Agentic_BNY_AI_Compliance/   # or narrative_agent/
   README.md
+  requirements.txt
   examples/
-    input_example.json        # Example SAR input
-    input_example2.json       # Additional example input
+    input_example.json        # SAR input
+    input_example2.json
+    input_example3.json
+    ofac_reject_example.json  # OFAC_REJECT input
+  docs/
+    NARRATIVE_VALIDATION.md   # Narrative quality criteria and process
+    OFAC_REJECT.md            # OFAC_REJECT routing, KB, validation, example
   src/
     narrative_agent/
       __init__.py
-      agent.py                # CrewAI agent, task, crew; generate_narrative()
-      schemas.py              # NarrativeOutput, validate_input/validate_output
-      examples.py             # Local few-shot examples (fallback)
-      narrative_reference.py  # Local effectiveness guidelines (fallback)
-      knowledge_base.py       # Supabase client for report_types and narrative_examples
+      agent.py                # generate_narrative(), create_crew(); report-type routing
+      schemas.py              # NarrativeOutput, validate_input (report-type-aware)
+      report_types.py         # Registry: SAR, OFAC_REJECT (required keys, agent role, local guidance)
+      knowledge_base.py       # Supabase report_types + narrative_examples; OFAC_REJECT fallback
+      narrative_validation.py # validate_narrative() per report type (SAR / OFAC_REJECT)
+      examples.py             # Local few-shot (legacy)
+      narrative_reference.py  # Local SAR guidelines (legacy)
   tests/
     test_schemas.py
     test_agent.py
+    test_knowledge_base.py
+    test_ofac_reject.py       # OFAC_REJECT routing, validation, sample JSON
   notebooks/
-    sar_narrative_demo.ipynb
+    sar_narrative_demo.ipynb  # SAR (1–7) + OFAC_REJECT (8), validation
 ```
 
 ### Verifying Supabase connectivity
 
-To quickly verify that the knowledge base is wired correctly for SAR reports, run:
+To verify the knowledge base for SAR:
 
 ```bash
-cd narrative_agent
 PYTHONPATH=src python -c "
 from narrative_agent.knowledge_base import fetch_report_type_config, fetch_narrative_examples
 cfg = fetch_report_type_config('SAR')
@@ -126,7 +159,12 @@ print('Loaded examples:', len(examples))
 "
 ```
 
-If this succeeds, the narrative agent will automatically use the Supabase-hosted instructions and examples when generating narratives.
+If this succeeds, the agent uses Supabase-hosted instructions and examples for SAR. **OFAC_REJECT** works without Supabase: if no row exists for that code, local guidance from `report_types.py` is used.
+
+### Documentation
+
+- **`docs/NARRATIVE_VALIDATION.md`** — Narrative quality criteria, validation process, and pass/fail checks.
+- **`docs/OFAC_REJECT.md`** — OFAC_REJECT routing, KB retrieval, required input, validation, and example narrative.
 
 ### License
 
