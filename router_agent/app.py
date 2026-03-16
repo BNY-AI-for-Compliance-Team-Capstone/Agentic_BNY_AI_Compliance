@@ -8,6 +8,7 @@ All logic and UI live in router_agent; no changes to backend or main Streamlit a
 
 from __future__ import annotations
 
+import ast
 import json
 import sys
 from pathlib import Path
@@ -94,15 +95,28 @@ with t_text:
             st.session_state["router_result"] = result
             st.session_state["pending_payload"] = {"subject": {"name": subject}, "case_description": text}
 
+def _parse_json_or_python_dict(text: str):
+    """Parse strict JSON first; if that fails, try Python dict literal (single quotes, True/False/None)."""
+    text = text.strip()
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError:
+        try:
+            return ast.literal_eval(text)
+        except (ValueError, SyntaxError):
+            raise json.JSONDecodeError("Use double-quoted JSON or a valid Python dict (single quotes, True/False/None)", text, 0)
+
+
 with t_json:
     st.markdown("#### Paste or upload case JSON")
+    st.caption("Accepts strict JSON (double quotes) or Python-style dict (single quotes, True/False/None).")
     json_raw = st.text_area("JSON", height=200, placeholder='{"report_type": "SAR", "subject": {"name": "..."}, ...}', key="json_input")
     if st.button("Classify & validate", key="btn_json"):
         if not json_raw.strip():
             st.warning("Enter or paste JSON.")
         else:
             try:
-                payload = json.loads(json_raw)
+                payload = _parse_json_or_python_dict(json_raw)
                 if isinstance(payload, list) and payload:
                     payload = payload[0]
                 if not isinstance(payload, dict):
@@ -114,6 +128,8 @@ with t_json:
                     st.session_state["pending_payload"] = payload
             except json.JSONDecodeError as e:
                 st.error(f"Invalid JSON: {e}")
+            except (ValueError, SyntaxError) as e:
+                st.error(f"Invalid input: {e}")
 
 st.markdown("---")
 st.markdown("### Next: submit to full pipeline")
