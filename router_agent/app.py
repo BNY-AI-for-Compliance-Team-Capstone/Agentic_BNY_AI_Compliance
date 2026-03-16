@@ -77,25 +77,54 @@ def _render_router_result(result: RouterResult, payload: dict) -> None:
         st.info(result.message)
         with st.expander(f"Show missing required fields ({len(result.missing_fields)})"):
             st.code(", ".join(result.missing_fields), language=None)
-        # Multi-turn: ask for each missing field using ask_user_prompt
+        # Multi-turn chat: agent asks one question at a time, user replies in a dialogue
         if result.missing_field_prompts:
+            if "chat_messages" not in st.session_state:
+                st.session_state["chat_messages"] = []
+            chat_messages = st.session_state["chat_messages"]
+            current_prompt = result.missing_field_prompts[0]
+            current_question = current_prompt.get("ask_user_prompt") or current_prompt.get("field_label") or current_prompt.get("input_key", "")
+            current_input_key = current_prompt.get("input_key", "")
+
             st.markdown("---")
-            st.markdown("#### Provide missing information")
-            st.caption("Answer each prompt below; then click **Submit answers & re-validate** until all required fields are filled.")
-            merged = copy.deepcopy(payload)
-            for p in result.missing_field_prompts:
-                key = p.get("input_key", "")
-                label = p.get("ask_user_prompt") or p.get("field_label") or key
-                ui_key = f"missing_{key.replace('.', '_')}"
-                val = st.text_input(label, key=ui_key, placeholder=f"Value for {key}")
-                _set_nested(merged, key, str(val).strip() if val else "")
-            if st.button("Submit answers & re-validate", key="btn_revalidate"):
-                with st.spinner("Re-validating..."):
+            st.markdown("#### Collect missing information (chat)")
+            st.caption("Reply in the chat below. The agent will ask for one required field at a time until everything is filled.")
+
+            # Render conversation history
+            for msg in chat_messages:
+                with st.chat_message(msg["role"]):
+                    st.write(msg["content"])
+
+            # Current agent question (waiting for user reply)
+            with st.chat_message("assistant"):
+                st.write(current_question)
+
+            # User reply
+            reply = st.chat_input("Type your answer and press Enter")
+            if reply is not None and reply.strip() and current_input_key:
+                # Append this exchange to history
+                new_messages = chat_messages + [
+                    {"role": "assistant", "content": current_question, "input_key": current_input_key},
+                    {"role": "user", "content": reply.strip()},
+                ]
+                merged = copy.deepcopy(payload)
+                _set_nested(merged, current_input_key, reply.strip())
+                with st.spinner("Checking..."):
                     new_result = run_router(merged)
                 st.session_state["router_result"] = new_result
                 st.session_state["pending_payload"] = merged
+                st.session_state["chat_messages"] = new_messages
                 st.rerun()
     else:
+        # Show conversation history if we collected fields via chat
+        if st.session_state.get("chat_messages"):
+            st.markdown("---")
+            st.markdown("#### Dialogue")
+            for msg in st.session_state["chat_messages"]:
+                with st.chat_message(msg["role"]):
+                    st.write(msg["content"])
+            with st.chat_message("assistant"):
+                st.write("All required fields are filled. You can download the complete JSON below or submit to the pipeline.")
         st.success(result.message)
         # Output complete JSON: initial input + all filled required fields (for aggregator/pipeline)
         st.markdown("---")
@@ -142,6 +171,7 @@ with t_text:
                 result = run_router(text.strip())
             st.session_state["router_result"] = result
             st.session_state["pending_payload"] = {"subject": {"name": subject}, "case_description": text}
+            st.session_state["chat_messages"] = []
 
 def _parse_json_or_python_dict(text: str):
     """Parse strict JSON first; if that fails, try Python dict literal (single quotes, True/False/None)."""
@@ -174,6 +204,7 @@ with t_json:
                         result = run_router(payload)
                     st.session_state["router_result"] = result
                     st.session_state["pending_payload"] = payload
+                    st.session_state["chat_messages"] = []
             except json.JSONDecodeError as e:
                 st.error(f"Invalid JSON: {e}")
             except (ValueError, SyntaxError) as e:
