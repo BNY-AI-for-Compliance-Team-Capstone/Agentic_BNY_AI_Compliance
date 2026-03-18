@@ -11,18 +11,22 @@ from crewai import Agent, Crew, LLM, Process, Task
 from loguru import logger
 
 from backend.config.settings import settings
+from backend.agents.narrative_schemas import validate_input, validate_output
 
 
 class NarrativeKnowledgeBaseError(RuntimeError):
     """Raised when narrative guidance cannot be loaded from Supabase."""
 
 
-def _validate_input(data: Dict[str, Any]) -> Dict[str, Any]:
-    required = {"case_id", "subject", "SuspiciousActivityInformation"}
-    missing = required - set(data.keys())
-    if missing:
-        raise ValueError(f"Input missing required keys: {sorted(missing)}")
-    return data
+def _fallback_guidance_context(report_type_code: str) -> Tuple[str, str]:
+    code = (report_type_code or "SAR").upper()
+    instructions = (
+        f"Use only facts present in the input payload for {code}. "
+        "Include who/what/when/where/why/how, amounts, date range, and clear suspicious rationale. "
+        "Do not invent missing values; if unknown, state that explicitly."
+    )
+    return instructions, ""
+
 
 
 def _supabase_rest_url() -> str:
@@ -47,7 +51,10 @@ def _supabase_headers() -> Dict[str, str]:
 
 def _supabase_get(table: str, params: Dict[str, str]) -> List[Dict[str, Any]]:
     url = f"{_supabase_rest_url()}/{table}"
-    response = requests.get(url, headers=_supabase_headers(), params=params, timeout=20)
+    try:
+        response = requests.get(url, headers=_supabase_headers(), params=params, timeout=6)
+    except requests.RequestException as exc:
+        raise NarrativeKnowledgeBaseError(f"Failed to fetch {table}: {exc}") from exc
     if not response.ok:
         raise NarrativeKnowledgeBaseError(
             f"Failed to fetch {table}: {response.status_code} {response.text}"
@@ -144,7 +151,15 @@ def _fetch_narrative_examples(report_type_code: str) -> List[Dict[str, Any]]:
 
 
 def _build_guidance_context(report_type_code: str) -> Tuple[str, str]:
-    row = _fetch_report_type_row(report_type_code)
+    try:
+        row = _fetch_report_type_row(report_type_code)
+    except Exception as exc:
+        logger.warning(
+            "Narrative guidance fallback activated for {}: {}",
+            report_type_code,
+            exc,
+        )
+        return _fallback_guidance_context(report_type_code)
 
     instruction_parts: List[str] = []
     instructions = (row.get("narrative_instructions") or "").strip()
@@ -158,7 +173,12 @@ def _build_guidance_context(report_type_code: str) -> Tuple[str, str]:
             instruction_parts.append("Additional narrative guidance from schema:")
             instruction_parts.extend([f"- {item}" for item in guidance if item])
 
-    examples_rows = _fetch_narrative_examples(report_type_code)
+    try:
+        examples_rows = _fetch_narrative_examples(report_type_code)
+    except Exception as exc:
+        logger.warning("Narrative examples unavailable for {}: {}", report_type_code, exc)
+        examples_rows = []
+
     example_chunks: List[str] = []
     for idx, row in enumerate(examples_rows, 1):
         summary = (row.get("summary") or "").strip()
@@ -178,6 +198,8 @@ def _build_guidance_context(report_type_code: str) -> Tuple[str, str]:
 
     instructions_text = "\n\n".join(instruction_parts).strip()
     examples_text = "\n".join(example_chunks).strip()
+    if not instructions_text and not examples_text:
+        return _fallback_guidance_context(report_type_code)
     return instructions_text, examples_text
 
 
@@ -209,10 +231,11 @@ def _parse_narrative_output(raw_output: str) -> str:
     if match:
         text = match.group(0)
     data = json.loads(text)
-    narrative = data.get("narrative")
-    if not isinstance(narrative, str) or not narrative.strip():
+    parsed = validate_output(data)
+    narrative = parsed.narrative.strip()
+    if not narrative:
         raise ValueError("Narrative output missing required 'narrative' text.")
-    return narrative.strip()
+    return narrative
 
 
 def generate_narrative_payload(
@@ -233,7 +256,7 @@ def generate_narrative_payload(
         "regulations_cited": [...]
       }
     """
-    _validate_input(input_data)
+    validate_input(input_data)
     report_code = (report_type_code or "SAR").upper()
 
     llm = LLM(

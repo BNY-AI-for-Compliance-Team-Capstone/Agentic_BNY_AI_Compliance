@@ -272,6 +272,13 @@ class SARReportFiler(BaseReportFiler):
         normalized_case: Dict[str, Any],
         injected_narrative: str | None = None,
     ) -> tuple[Path, str, Dict[str, str]]:
+        # Enforce the newer FinCEN AcroForm when available.
+        if SAR_TEMPLATE_PATH.exists():
+            self.template_path = SAR_TEMPLATE_PATH
+            variant = self._detect_template_variant()
+            fields = self._build_field_values(normalized_case, variant, injected_narrative)
+            return SAR_TEMPLATE_PATH, variant, fields
+
         candidates: List[Path] = []
         for path in self.AUTO_TEMPLATE_PATHS:
             if path.exists():

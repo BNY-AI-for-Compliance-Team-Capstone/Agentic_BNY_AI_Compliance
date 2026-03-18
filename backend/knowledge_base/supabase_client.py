@@ -151,10 +151,26 @@ Index("idx_job_status_status", JobStatus.status)
 
 
 class SupabaseClient:
+    _engines: Dict[str, Any] = {}
+    _sessionmakers: Dict[str, Any] = {}
+
     def __init__(self, database_url: Optional[str] = None):
         database_url = database_url or settings.get_database_url()
-        self.engine = create_engine(database_url, future=True)
-        self.SessionLocal = sessionmaker(bind=self.engine, future=True)
+        if database_url not in self._engines:
+            parsed = make_url(database_url)
+            connect_args: Dict[str, Any] = {}
+            if parsed.get_backend_name().startswith("postgresql"):
+                # Keep health checks and failed DB probes from blocking UI for 30s+.
+                connect_args["connect_timeout"] = 3
+            self._engines[database_url] = create_engine(
+                database_url,
+                future=True,
+                pool_pre_ping=True,
+                connect_args=connect_args,
+            )
+            self._sessionmakers[database_url] = sessionmaker(bind=self._engines[database_url], future=True)
+        self.engine = self._engines[database_url]
+        self.SessionLocal = self._sessionmakers[database_url]
         parsed = make_url(database_url)
         logger.debug(
             "Supabase client configured for user={} host={} db={}",
@@ -353,9 +369,40 @@ class SupabaseClient:
                 "status": record.status.value,
                 "current_agent": record.current_agent,
                 "progress": record.progress,
+                "input_data": record.input_data,
                 "result": record.result,
                 "error_message": record.error_message,
+                "created_at": record.created_at.isoformat() if record.created_at else None,
+                "updated_at": record.updated_at.isoformat() if record.updated_at else None,
             }
+
+    def list_jobs(self, limit: int = 100, status: Optional[str] = None) -> List[Dict[str, Any]]:
+        with self._session() as session:
+            query = session.query(JobStatus)
+            if status:
+                try:
+                    query = query.filter_by(status=JobStatusEnum[status])
+                except KeyError:
+                    # Unknown status filter -> no rows
+                    return []
+            rows = query.order_by(JobStatus.created_at.desc()).limit(max(limit, 1)).all()
+
+            out: List[Dict[str, Any]] = []
+            for record in rows:
+                out.append(
+                    {
+                        "job_id": str(record.job_id),
+                        "status": record.status.value,
+                        "current_agent": record.current_agent,
+                        "progress": record.progress,
+                        "input_data": record.input_data,
+                        "result": record.result,
+                        "error_message": record.error_message,
+                        "created_at": record.created_at.isoformat() if record.created_at else None,
+                        "updated_at": record.updated_at.isoformat() if record.updated_at else None,
+                    }
+                )
+            return out
 
     def add_field_mapping(self, data: Dict[str, Any]) -> uuid.UUID:
         with self._session() as session:

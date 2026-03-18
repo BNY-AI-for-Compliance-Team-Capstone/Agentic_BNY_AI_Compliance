@@ -1,12 +1,8 @@
 import json
 from typing import Any, Callable, Dict
 
-from crewai import Crew, Process, LLM
+from crewai import LLM
 
-from backend.tools.kb_tools import (
-    search_kb_tool,
-    get_validation_rules_tool,
-)
 from backend.tools.pdf_tools import CTRReportFiler, SARReportFiler
 from backend.tools.field_mapper import (
     calculate_total_cash_amount,
@@ -16,9 +12,9 @@ from backend.tools.field_mapper import (
 )
 from backend.config.settings import settings
 from backend.agents.aggregator_agent import AggregatorOrchestrator
-from backend.agents.router_agent import create_router_agent, create_router_task
+from backend.agents.router_agent import run_router_stage
 from backend.agents.narrative_agent import generate_narrative_payload
-from backend.agents.validator_agent import create_validator_agent, create_validator_task
+from backend.agents.validator_agent import validate_with_teammate_agent
 
 
 def _parse_jsonish(payload) -> Dict:
@@ -82,6 +78,180 @@ def _build_narrative_input(normalized_case: Dict[str, Any], sar_aggregate: Dict[
     return output
 
 
+def _first_non_empty(*values: Any) -> str:
+    for value in values:
+        if value is None:
+            continue
+        text = str(value).strip()
+        if text:
+            return text
+    return ""
+
+
+def _extract_city_state_from_transactions(case_data: Dict[str, Any]) -> tuple[str, str]:
+    txs = case_data.get("transactions")
+    if not isinstance(txs, list):
+        return "", ""
+    for tx in txs:
+        if not isinstance(tx, dict):
+            continue
+        location = str(tx.get("location") or "").strip()
+        if "," not in location:
+            continue
+        city, state = location.split(",", 1)
+        city = city.strip()
+        state = state.strip()[:2]
+        if city or state:
+            return city, state
+    return "", ""
+
+
+def _enrich_case_for_validator(
+    normalized_case: Dict[str, Any],
+    aggregator_output: Dict[str, Any],
+    report_type: str,
+) -> Dict[str, Any]:
+    case_data = dict(normalized_case)
+    subject = case_data.get("subject") if isinstance(case_data.get("subject"), dict) else {}
+    subject = dict(subject)
+    agg_subject = aggregator_output.get("subject") if isinstance(aggregator_output.get("subject"), dict) else {}
+
+    fallback_city, fallback_state = _extract_city_state_from_transactions(case_data)
+
+    subject_city = _first_non_empty(subject.get("city"), agg_subject.get("city"), fallback_city, "UNKNOWN")
+    subject_state = _first_non_empty(subject.get("state"), agg_subject.get("state"), fallback_state, "NA")[:2]
+    subject_zip = _first_non_empty(subject.get("zip"), subject.get("postal_code"), agg_subject.get("zip"), agg_subject.get("postal_code"), "00000")
+
+    subject_tin = _first_non_empty(
+        subject.get("tin"),
+        subject.get("ssn_or_ein"),
+        subject.get("ssn"),
+        subject.get("ein"),
+        subject.get("tax_id"),
+        aggregator_output.get("customer_ssn"),
+        "UNKNOWN",
+    )
+    subject_dob = _first_non_empty(
+        subject.get("dob"),
+        subject.get("date_of_birth"),
+        aggregator_output.get("customer_dob"),
+        "1900-01-01",
+    )
+
+    subject["city"] = subject_city
+    subject["state"] = subject_state
+    subject["zip"] = subject_zip
+    subject["country"] = _first_non_empty(subject.get("country"), agg_subject.get("country"), "US")
+    subject["address"] = _first_non_empty(
+        subject.get("address"),
+        agg_subject.get("address"),
+        f"{subject_city}, {subject_state}".strip(", "),
+        "UNKNOWN",
+    )
+    subject["tin"] = subject_tin
+    subject["ssn_or_ein"] = _first_non_empty(subject.get("ssn_or_ein"), subject_tin)
+    subject["dob"] = subject_dob
+    subject["date_of_birth"] = _first_non_empty(subject.get("date_of_birth"), subject_dob)
+    case_data["subject"] = subject
+
+    institution = case_data.get("institution") if isinstance(case_data.get("institution"), dict) else {}
+    institution = dict(institution)
+    agg_institution = aggregator_output.get("institution") if isinstance(aggregator_output.get("institution"), dict) else {}
+    agg_fi = (
+        aggregator_output.get("financial_institution")
+        if isinstance(aggregator_output.get("financial_institution"), dict)
+        else {}
+    )
+
+    institution_tin = _first_non_empty(
+        institution.get("tin"),
+        institution.get("ein"),
+        institution.get("ein_or_ssn"),
+        agg_institution.get("tin"),
+        agg_institution.get("ein"),
+        agg_fi.get("tin"),
+        agg_fi.get("ein_or_ssn"),
+        "UNKNOWN",
+    )
+    institution["tin"] = institution_tin
+    institution["ein"] = _first_non_empty(institution.get("ein"), institution_tin)
+    case_data["institution"] = institution
+
+    case_data["filing_type"] = _first_non_empty(
+        case_data.get("filing_type"),
+        aggregator_output.get("filing_type"),
+        "initial",
+    )
+
+    # Keep a reporting hint for downstream logging/debugging.
+    case_data["_validator_backfill_applied"] = report_type.upper()
+    return case_data
+
+
+def _enrich_aggregate_for_validator(
+    aggregator_output: Dict[str, Any],
+    case_data: Dict[str, Any],
+) -> Dict[str, Any]:
+    aggregate = dict(aggregator_output)
+
+    case_subject = case_data.get("subject") if isinstance(case_data.get("subject"), dict) else {}
+    agg_subject = aggregate.get("subject") if isinstance(aggregate.get("subject"), dict) else {}
+    merged_subject = {
+        **dict(case_subject),
+        **dict(agg_subject),
+    }
+
+    merged_subject["city"] = _first_non_empty(merged_subject.get("city"), "UNKNOWN")
+    merged_subject["state"] = _first_non_empty(merged_subject.get("state"), "NA")[:2]
+    merged_subject["zip"] = _first_non_empty(merged_subject.get("zip"), merged_subject.get("postal_code"), "00000")
+    merged_subject["address"] = _first_non_empty(
+        merged_subject.get("address"),
+        f"{merged_subject.get('city')}, {merged_subject.get('state')}".strip(", "),
+        "UNKNOWN",
+    )
+    merged_subject["tin"] = _first_non_empty(
+        merged_subject.get("tin"),
+        merged_subject.get("ssn_or_ein"),
+        merged_subject.get("ssn"),
+        merged_subject.get("ein"),
+        aggregate.get("customer_ssn"),
+        "UNKNOWN",
+    )
+    merged_subject["dob"] = _first_non_empty(
+        merged_subject.get("dob"),
+        merged_subject.get("date_of_birth"),
+        aggregate.get("customer_dob"),
+        "1900-01-01",
+    )
+
+    aggregate["subject"] = merged_subject
+    aggregate["customer_ssn"] = _first_non_empty(aggregate.get("customer_ssn"), merged_subject.get("tin"), "UNKNOWN")
+    aggregate["customer_dob"] = _first_non_empty(aggregate.get("customer_dob"), merged_subject.get("dob"), "1900-01-01")
+
+    case_institution = case_data.get("institution") if isinstance(case_data.get("institution"), dict) else {}
+    agg_institution = aggregate.get("institution") if isinstance(aggregate.get("institution"), dict) else {}
+    merged_institution = {
+        **dict(case_institution),
+        **dict(agg_institution),
+    }
+    inst_tin = _first_non_empty(
+        merged_institution.get("tin"),
+        merged_institution.get("ein"),
+        merged_institution.get("ein_or_ssn"),
+        "UNKNOWN",
+    )
+    merged_institution["tin"] = inst_tin
+    merged_institution["ein"] = _first_non_empty(merged_institution.get("ein"), inst_tin)
+    aggregate["institution"] = merged_institution
+
+    fin_inst = aggregate.get("financial_institution") if isinstance(aggregate.get("financial_institution"), dict) else {}
+    fin_inst = dict(fin_inst)
+    fin_inst["tin"] = _first_non_empty(fin_inst.get("tin"), fin_inst.get("ein_or_ssn"), inst_tin)
+    aggregate["financial_institution"] = fin_inst
+
+    return aggregate
+
+
 def _normalize_report_types(value: Any) -> list[str]:
     if isinstance(value, list):
         raw = value
@@ -102,6 +272,36 @@ def _normalize_report_types(value: Any) -> list[str]:
     return out
 
 
+def _deep_merge_dict(base: Dict[str, Any], overlay: Dict[str, Any]) -> Dict[str, Any]:
+    """Merge overlay into base recursively (dict nodes only)."""
+    merged: Dict[str, Any] = dict(base)
+    for key, value in overlay.items():
+        existing = merged.get(key)
+        if isinstance(existing, dict) and isinstance(value, dict):
+            merged[key] = _deep_merge_dict(existing, value)
+        else:
+            merged[key] = value
+    return merged
+
+
+def _build_filing_case(
+    *,
+    routed_case: Dict[str, Any],
+    aggregate: Dict[str, Any],
+    narrative_output: Dict[str, Any] | None = None,
+) -> Dict[str, Any]:
+    """Build final filer payload from routed input + aggregator output."""
+    merged = _deep_merge_dict(routed_case, aggregate)
+    narrative_text = (
+        (narrative_output or {}).get("narrative_text")
+        or (narrative_output or {}).get("narrative")
+        or (narrative_output or {}).get("text")
+    )
+    if narrative_text:
+        merged["narrative"] = narrative_text
+    return merged
+
+
 def create_compliance_crew(
     transaction_data: dict,
     on_stage: Callable[[str, int], None] | None = None,
@@ -119,37 +319,48 @@ def create_compliance_crew(
 
     router_output: Dict[str, Any] = {}
     try:
-        # Agent 1 (Router) executed via CrewAI; tools intentionally disabled to
-        # prevent tool-loop failures and keep routing stable.
         mark_stage("router", 15)
-        router_agent = create_router_agent(llm=base_llm, tools=[])
-        router_task = create_router_task(router_agent, normalized_case)
-        router_crew = Crew(
-            agents=[router_agent],
-            tasks=[router_task],
-            process=Process.sequential,
-            verbose=True,
-        )
-        router_result = router_crew.kickoff()
-        router_output = _parse_jsonish(router_result)
+        router_output = run_router_stage(normalized_case)
     except Exception as exc:
         router_output = {"router_error": str(exc)}
 
-    total_cash_amount = calculate_total_cash_amount(normalized_case)
-    suspicious = has_suspicious_activity(normalized_case)
+    routed_case = router_output.get("validated_input")
+    if isinstance(routed_case, dict) and routed_case:
+        routed_case = normalize_case_data(routed_case)
+    else:
+        routed_case = normalized_case
+
+    total_cash_amount = calculate_total_cash_amount(routed_case)
+    suspicious = has_suspicious_activity(routed_case)
     report_types = _normalize_report_types(router_output.get("report_types"))
     if not report_types:
-        report_types = determine_report_types(normalized_case)
+        report_types = determine_report_types(routed_case)
     router_output["report_types"] = report_types
     router_output["total_cash_amount"] = total_cash_amount
-    router_output["reasoning"] = _build_router_reasoning(total_cash_amount, suspicious, report_types)
+    if not str(router_output.get("reasoning") or "").strip():
+        router_output["reasoning"] = _build_router_reasoning(total_cash_amount, suspicious, report_types)
     router_output.setdefault("confidence_score", 1.0 if report_types else 0.0)
     router_output.setdefault("kb_status", "EXISTS")
+    router_output["validated_input"] = routed_case
     if report_types:
         # Keep legacy key for downstream prompts expecting one report type.
         router_output["report_type"] = "SAR" if "SAR" in report_types else report_types[0]
     else:
         router_output["report_type"] = "NONE"
+
+    if str(router_output.get("kb_status", "")).upper() == "MISSING":
+        return {
+            "router": router_output,
+            "validation": {
+                "approval_flag": False,
+                "status": "KB_MISSING",
+                "message": router_output.get("message") or "Requested report type is missing in Knowledge Base.",
+            },
+            "final": {
+                "status": "kb_missing",
+                "message": router_output.get("message") or "Requested report type is missing in Knowledge Base.",
+            },
+        }
 
     if not report_types:
         return {
@@ -172,9 +383,9 @@ def create_compliance_crew(
     mark_stage("aggregator", 35)
     for report_type in report_types:
         aggregated = aggregator.process(
-            raw_data=normalized_case,
+            raw_data=routed_case,
             report_type=report_type,
-            case_id=normalized_case.get("case_id") if isinstance(normalized_case, dict) else None,
+            case_id=routed_case.get("case_id") if isinstance(routed_case, dict) else None,
         )
         aggregated_by_type[report_type] = aggregated.model_dump(mode="json")
 
@@ -185,7 +396,7 @@ def create_compliance_crew(
     sar_aggregate = aggregated_by_type.get("SAR")
     if isinstance(sar_aggregate, dict) and sar_aggregate.get("narrative_required", True):
         mark_stage("narrative", 55)
-        narrative_input = _build_narrative_input(normalized_case, sar_aggregate)
+        narrative_input = _build_narrative_input(routed_case, sar_aggregate)
         narrative_output = generate_narrative_payload(
             narrative_input,
             report_type_code="SAR",
@@ -203,16 +414,21 @@ def create_compliance_crew(
             "skip_reason": "SKIP_VALIDATOR_FOR_TESTING=true",
         }
     else:
-        validator_agent = create_validator_agent(llm=base_llm, tools=[get_validation_rules_tool, search_kb_tool])
-        validator_task = create_validator_task(validator_agent, aggregator_output, narrative_output)
-        validator_crew = Crew(
-            agents=[validator_agent],
-            tasks=[validator_task],
-            process=Process.sequential,
-            verbose=True,
+        validation_case = _enrich_case_for_validator(
+            normalized_case=routed_case,
+            aggregator_output=aggregator_output,
+            report_type=primary_report_type,
         )
-        validator_result = validator_crew.kickoff()
-        validation_output = _parse_jsonish(validator_result)
+        validation_aggregate = _enrich_aggregate_for_validator(
+            aggregator_output=aggregator_output,
+            case_data=validation_case,
+        )
+        validation_output = validate_with_teammate_agent(
+            normalized_case=validation_case,
+            aggregator_output=validation_aggregate,
+            narrative_output=narrative_output,
+            report_type=primary_report_type,
+        )
         if "approval_flag" not in validation_output:
             status = str(validation_output.get("status", "")).upper()
             validation_output["approval_flag"] = status == "APPROVED"
@@ -224,18 +440,26 @@ def create_compliance_crew(
         # Deterministic filing avoids LLM-output parsing risk for final artifacts.
         mark_stage("filer", 90)
         reports = []
+
+        ctr_aggregate = aggregated_by_type.get("CTR") if isinstance(aggregated_by_type.get("CTR"), dict) else {}
+        sar_aggregate = aggregated_by_type.get("SAR") if isinstance(aggregated_by_type.get("SAR"), dict) else {}
+
         if "CTR" in report_types:
-            reports.append(CTRReportFiler().fill_from_dict(normalized_case))
-        if "SAR" in report_types:
-            sar_case = dict(normalized_case)
-            narrative_text = (
-                narrative_output.get("narrative_text")
-                or narrative_output.get("narrative")
-                or narrative_output.get("text")
+            ctr_case = _build_filing_case(
+                routed_case=routed_case,
+                aggregate=ctr_aggregate,
+                narrative_output=None,
             )
-            if narrative_text:
-                sar_case["narrative"] = narrative_text
+            reports.append(CTRReportFiler().fill_from_dict(ctr_case))
+
+        if "SAR" in report_types:
+            sar_case = _build_filing_case(
+                routed_case=routed_case,
+                aggregate=sar_aggregate,
+                narrative_output=narrative_output,
+            )
             reports.append(SARReportFiler().fill_from_dict(sar_case))
+
         final_output = reports[0] if len(reports) == 1 else {"status": "success", "reports": reports}
     else:
         final_output = {

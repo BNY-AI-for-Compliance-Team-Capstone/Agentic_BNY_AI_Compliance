@@ -1,9 +1,10 @@
 from __future__ import annotations
 
+import ast
+import copy
 import json
 import sys
 import time
-from datetime import date, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -22,11 +23,17 @@ from streamlit_app.config.settings import settings
 from streamlit_app.utils.api_client import APIClient, APIClientError
 from streamlit_app.utils.formatting import format_currency
 from streamlit_app.utils.session_state import add_tracked_job, init_session_state
-from streamlit_app.utils.validators import (
-    build_manual_case_payload,
-    build_text_case_payload,
-    validate_transaction_data,
-)
+
+TEAMMATE_ROUTER_ROOT = PROJECT_ROOT / "Agent 1  - Router Agent"
+if TEAMMATE_ROUTER_ROOT.exists() and str(TEAMMATE_ROUTER_ROOT) not in sys.path:
+    sys.path.insert(0, str(TEAMMATE_ROUTER_ROOT))
+
+try:
+    from router_agent.run import run_router
+    _router_import_error: Exception | None = None
+except Exception as exc:
+    run_router = None
+    _router_import_error = exc
 
 
 AGENT_ORDER = ["router", "aggregator", "narrative", "validator", "filer"]
@@ -139,6 +146,242 @@ def _submit_payload(api_client: APIClient, payload: dict[str, Any]) -> None:
         st.error(str(exc))
 
 
+def _set_nested(payload: dict[str, Any], path: str, value: str) -> None:
+    if not path.strip():
+        return
+    parts = path.split(".")
+    current: dict[str, Any] = payload
+    for key in parts[:-1]:
+        existing = current.get(key)
+        if not isinstance(existing, dict):
+            current[key] = {}
+        current = current[key]  # type: ignore[assignment]
+    current[parts[-1]] = value
+
+
+def _parse_json_or_python_dict(text: str) -> Any:
+    raw = text.strip()
+    try:
+        return json.loads(raw)
+    except json.JSONDecodeError:
+        return ast.literal_eval(raw)
+
+
+def _router_result_to_dict(result_obj: Any) -> dict[str, Any]:
+    if hasattr(result_obj, "to_dict"):
+        data = result_obj.to_dict()
+        return data if isinstance(data, dict) else {}
+    if isinstance(result_obj, dict):
+        return result_obj
+    return {}
+
+
+def _run_router(payload: Any) -> dict[str, Any]:
+    if run_router is None:
+        detail = f" (import error: {_router_import_error})" if _router_import_error else ""
+        raise RuntimeError(
+            "Teammate Router UI module is not available. "
+            f"Check Agent 1 folder and dependencies{detail}"
+        )
+    return _router_result_to_dict(run_router(payload))
+
+
+def _router_validated_payload(router_result: dict[str, Any], fallback_payload: dict[str, Any]) -> dict[str, Any]:
+    validated = router_result.get("validated_input") if isinstance(router_result, dict) else None
+    if isinstance(validated, dict) and validated:
+        return validated
+    return fallback_payload
+
+
+def _submit_router_payload(payload: dict[str, Any], backend_url: str, default_api_client: APIClient) -> None:
+    submit_client = default_api_client
+    url = (backend_url or "").strip()
+    if url and url.rstrip("/") != default_api_client.base_url.rstrip("/"):
+        submit_client = APIClient(base_url=url, timeout=default_api_client.timeout)
+    _submit_payload(submit_client, payload)
+
+
+def _render_router_result(router_result: dict[str, Any], payload: dict[str, Any]) -> None:
+    effective_payload = _router_validated_payload(router_result, payload)
+    st.subheader("Router result")
+    st.table(
+        [
+            {"Field": "Report type", "Value": router_result.get("report_type")},
+            {"Field": "Report types", "Value": router_result.get("report_types")},
+            {"Field": "Knowledge base", "Value": router_result.get("kb_status")},
+            {"Field": "Confidence", "Value": router_result.get("confidence_score")},
+            {"Field": "Reasoning", "Value": router_result.get("reasoning") or "(none)"},
+        ]
+    )
+
+    st.markdown("**Message**")
+    missing_fields = router_result.get("missing_fields") if isinstance(router_result.get("missing_fields"), list) else []
+    missing_prompts = (
+        router_result.get("missing_field_prompts")
+        if isinstance(router_result.get("missing_field_prompts"), list)
+        else []
+    )
+
+    if missing_fields:
+        st.info(str(router_result.get("message") or "Missing required fields."))
+        with st.expander(f"Show missing required fields ({len(missing_fields)})"):
+            st.code(", ".join(str(item) for item in missing_fields), language=None)
+
+        if missing_prompts:
+            chat_messages = st.session_state.setdefault("router_chat_messages", [])
+            current_prompt = missing_prompts[0] if missing_prompts else {}
+            current_question = (
+                current_prompt.get("ask_user_prompt")
+                or current_prompt.get("field_label")
+                or current_prompt.get("input_key", "")
+            )
+            current_input_key = current_prompt.get("input_key", "")
+
+            st.markdown("---")
+            st.markdown("#### Collect missing information (chat)")
+            st.caption("Reply one field at a time. Router will re-validate automatically.")
+
+            for msg in chat_messages:
+                with st.chat_message(msg.get("role", "assistant")):
+                    st.write(msg.get("content", ""))
+
+            with st.chat_message("assistant"):
+                st.write(current_question)
+
+            reply = st.chat_input("Type your answer and press Enter", key="router_chat_input")
+            if reply and str(current_input_key).strip():
+                merged = copy.deepcopy(effective_payload)
+                _set_nested(merged, str(current_input_key), reply.strip())
+                new_messages = chat_messages + [
+                    {"role": "assistant", "content": current_question, "input_key": current_input_key},
+                    {"role": "user", "content": reply.strip()},
+                ]
+                try:
+                    with st.spinner("Checking..."):
+                        new_result = _run_router(merged)
+                except Exception as exc:
+                    st.error(str(exc))
+                else:
+                    st.session_state["router_result"] = new_result
+                    st.session_state["router_pending_payload"] = _router_validated_payload(new_result, merged)
+                    st.session_state["router_chat_messages"] = new_messages
+                    st.rerun()
+        return
+
+    if st.session_state.get("router_chat_messages"):
+        st.markdown("---")
+        st.markdown("#### Dialogue")
+        for msg in st.session_state.get("router_chat_messages", []):
+            with st.chat_message(msg.get("role", "assistant")):
+                st.write(msg.get("content", ""))
+        with st.chat_message("assistant"):
+            st.write("All required fields are filled. You can submit to pipeline.")
+
+    st.success(str(router_result.get("message") or "Ready for pipeline."))
+    st.markdown("---")
+    st.markdown("#### Complete case JSON (for pipeline)")
+    st.caption("This payload will be passed to Agent 3 via the backend pipeline.")
+
+    json_str = json.dumps(effective_payload, indent=2)
+    st.code(json_str, language="json")
+
+    case_id = effective_payload.get("case_id") if isinstance(effective_payload, dict) else None
+    safe_id = "".join(ch if ch.isalnum() or ch in "-_" else "_" for ch in str(case_id or "case"))[:64]
+    st.download_button(
+        label="Download complete JSON",
+        data=json_str,
+        file_name=f"{safe_id}_complete.json",
+        mime="application/json",
+        key="router_download_complete_json",
+    )
+
+
+def _render_router_intake_workspace(api_client: APIClient) -> None:
+    st.markdown("### Router Agent - Case Intake")
+    st.caption("Classify report type, validate required fields, then submit to the full pipeline.")
+
+    default_backend_url = st.session_state.get("router_backend_url", api_client.base_url)
+    backend_url = st.text_input("API base URL", value=default_backend_url, key="router_backend_url")
+
+    tab_text, tab_json = st.tabs(["Text input", "JSON input"])
+
+    with tab_text:
+        st.markdown("#### Free-text case description")
+        subject = st.text_input("Subject name", value="Unknown Subject", key="router_text_subject")
+        text_input = st.text_area(
+            "Case description",
+            height=200,
+            placeholder="E.g. File SAR for suspicious wire transfers with structuring behavior.",
+            key="router_text_input",
+        )
+        if st.button("Classify & validate", key="router_btn_text"):
+            if not text_input.strip():
+                st.warning("Enter case text.")
+            else:
+                try:
+                    with st.spinner("Running router..."):
+                        result = _run_router(text_input.strip())
+                except Exception as exc:
+                    st.error(str(exc))
+                else:
+                    seed_payload = {
+                        "subject": {"name": subject},
+                        "case_description": text_input,
+                    }
+                    st.session_state["router_result"] = result
+                    st.session_state["router_pending_payload"] = _router_validated_payload(result, seed_payload)
+                    st.session_state["router_chat_messages"] = []
+
+    with tab_json:
+        st.markdown("#### Paste case JSON")
+        st.caption("Accepts strict JSON or Python dict format (single quotes, True/False/None).")
+        json_raw = st.text_area(
+            "JSON",
+            height=200,
+            placeholder='{"report_type": "SAR", "subject": {"name": "..."}}',
+            key="router_json_input",
+        )
+        if st.button("Classify & validate", key="router_btn_json"):
+            if not json_raw.strip():
+                st.warning("Enter or paste JSON.")
+            else:
+                try:
+                    payload = _parse_json_or_python_dict(json_raw)
+                except (json.JSONDecodeError, ValueError, SyntaxError) as exc:
+                    st.error(f"Invalid input: {exc}")
+                else:
+                    if isinstance(payload, list) and payload:
+                        payload = payload[0]
+                    if not isinstance(payload, dict):
+                        st.error("JSON must be an object or an array of objects.")
+                    else:
+                        try:
+                            with st.spinner("Running router..."):
+                                result = _run_router(payload)
+                        except Exception as exc:
+                            st.error(str(exc))
+                        else:
+                            st.session_state["router_result"] = result
+                            st.session_state["router_pending_payload"] = _router_validated_payload(result, payload)
+                            st.session_state["router_chat_messages"] = []
+
+    st.markdown("---")
+    st.markdown("### Next: submit to full pipeline")
+
+    router_result = st.session_state.get("router_result")
+    pending_payload = st.session_state.get("router_pending_payload")
+    if isinstance(router_result, dict) and isinstance(pending_payload, dict):
+        pipeline_payload = _router_validated_payload(router_result, pending_payload)
+        st.session_state["router_pending_payload"] = pipeline_payload
+        _render_router_result(router_result, pipeline_payload)
+        if st.button("Submit to full pipeline", type="primary", key="router_submit_pipeline"):
+            _submit_router_payload(pipeline_payload, backend_url, api_client)
+            st.session_state.pop("router_result", None)
+            st.session_state.pop("router_pending_payload", None)
+    else:
+        st.caption("Use Text input or JSON input above and click Classify & validate, then submit here.")
+
+
 def _render_agent_outputs(details: dict[str, Any], api_client: APIClient) -> None:
     result = _result_payload(details)
     router = result.get("router") if isinstance(result.get("router"), dict) else {}
@@ -154,13 +397,19 @@ def _render_agent_outputs(details: dict[str, Any], api_client: APIClient) -> Non
         aggregate = result.get("aggregator")
 
     st.markdown("#### Classification")
+    missing_fields = router.get("missing_fields") if isinstance(router.get("missing_fields"), list) else []
+    if missing_fields:
+        st.warning("Some required router fields are missing. Add them and resubmit for best results.")
+
     st.table(
         _rows_from_dict(
             {
                 "Report Types": router.get("report_types", []),
                 "Reasoning": router.get("reasoning"),
+                "Message": router.get("message"),
                 "Confidence Score": router.get("confidence_score"),
                 "Knowledge Base Status": router.get("kb_status"),
+                "Missing Fields": missing_fields,
             }
         )
     )
@@ -325,217 +574,6 @@ api_client: APIClient = st.session_state["api_client"]
 render_sidebar(api_client)
 render_header("Submit New Case", "Submit text or structured data for end-to-end compliance processing")
 
-st.markdown(
-    """
-    <div class="submit-hero">
-      <div class="submit-hero-title">Case Intake Workspace</div>
-      <div class="submit-hero-subtitle">
-        Choose one input method, submit the case, and track processing in real time.
-      </div>
-    </div>
-    """,
-    unsafe_allow_html=True,
-)
-
-step_1, step_2, step_3 = st.columns(3)
-with step_1:
-    st.markdown(
-        """
-        <div class="submit-step-card">
-          <div class="submit-step-title">1. Provide Input</div>
-          <div class="submit-step-text">Use text, JSON upload, or manual entry form.</div>
-        </div>
-        """,
-        unsafe_allow_html=True,
-    )
-with step_2:
-    st.markdown(
-        """
-        <div class="submit-step-card">
-          <div class="submit-step-title">2. Start Processing</div>
-          <div class="submit-step-text">Submit the case for classification and preparation.</div>
-        </div>
-        """,
-        unsafe_allow_html=True,
-    )
-with step_3:
-    st.markdown(
-        """
-        <div class="submit-step-card">
-          <div class="submit-step-title">3. Review Outcome</div>
-          <div class="submit-step-text">Track status and download the final filed report.</div>
-        </div>
-        """,
-        unsafe_allow_html=True,
-    )
-
-st.markdown('<div class="home-section-title">Case Submission</div>', unsafe_allow_html=True)
-
-t_text, t_upload, t_manual, t_batch, t_direct = st.tabs(
-    ["Text Input", "Upload JSON", "Manual Entry", "Batch Upload", "Direct PDF Filing"]
-)
-
-with t_text:
-    st.markdown("#### Free-Text Case Intake")
-    subject_name = st.text_input("Subject Name", value="Unknown Subject", key="text_subject_name")
-    free_text = st.text_area(
-        "Case Description",
-        height=220,
-        placeholder="Describe transactions and patterns. The system will classify filing requirements.",
-    )
-    if st.button("Submit Text Case", use_container_width=True):
-        if not free_text.strip():
-            st.warning("Enter case text before submitting.")
-        else:
-            payload = build_text_case_payload(free_text, subject_name=subject_name)
-            _submit_payload(api_client, payload)
-
-with t_upload:
-    uploaded = st.file_uploader("Upload case JSON", type=["json"])
-    parsed = None
-    if uploaded is not None:
-        try:
-            parsed = json.load(uploaded)
-            st.success("File uploaded successfully")
-            with st.expander("Preview Data"):
-                st.json(parsed)
-        except json.JSONDecodeError as exc:
-            st.error(f"Invalid JSON: {exc}")
-
-    if parsed is not None:
-        candidate = parsed[0] if isinstance(parsed, list) and parsed else parsed
-        valid, errors = validate_transaction_data(candidate)
-        if valid:
-            st.success("Validation passed")
-            if st.button("Submit JSON for Analysis", use_container_width=True):
-                payload = candidate if isinstance(candidate, dict) else {}
-                _submit_payload(api_client, payload)
-        else:
-            st.error("Validation failed")
-            for err in errors:
-                st.write(f"- {err}")
-
-with t_manual:
-    lcol, rcol = st.columns(2)
-    with lcol:
-        subject_name = st.text_input("Subject Name *", key="manual_subject_name")
-        subject_type = st.selectbox("Subject Type", ["Individual", "Entity"])
-        country = st.text_input("Country", value="US")
-        occupation = st.text_input("Occupation/Industry")
-
-    with rcol:
-        amount = st.number_input("Total Amount USD *", min_value=0.0, value=1000.0, step=100.0)
-        from_date = st.date_input("Activity From Date", value=date.today() - timedelta(days=1))
-        to_date = st.date_input("Activity To Date", value=date.today())
-        instrument = st.selectbox("Instrument Type", ["U.S. Currency", "Wire", "Check", "ACH", "Other"])
-
-    st.markdown("##### Suspicious Activity Indicators")
-    c1, c2, c3 = st.columns(3)
-    with c1:
-        structuring = st.checkbox("Structuring")
-        money_laundering = st.checkbox("Money Laundering")
-        terrorist = st.checkbox("Terrorist Financing")
-    with c2:
-        wire_fraud = st.checkbox("Wire Fraud")
-        identity = st.checkbox("Identity Theft")
-        check_fraud = st.checkbox("Check Fraud")
-    with c3:
-        takeover = st.checkbox("Account Takeover")
-        mortgage = st.checkbox("Mortgage Fraud")
-        other = st.checkbox("Other")
-
-    notes = st.text_area("Additional Notes", height=150)
-
-    if st.button("Submit Manual Case", use_container_width=True):
-        flags = [
-            label
-            for enabled, label in [
-                (structuring, "Structuring"),
-                (money_laundering, "Money Laundering"),
-                (terrorist, "Terrorist Financing"),
-                (wire_fraud, "Wire Fraud"),
-                (identity, "Identity Theft"),
-                (check_fraud, "Check Fraud"),
-                (takeover, "Account Takeover"),
-                (mortgage, "Mortgage Fraud"),
-                (other, "Other"),
-            ]
-            if enabled
-        ]
-
-        payload = build_manual_case_payload(
-            subject_name=subject_name,
-            subject_type=subject_type,
-            country=country,
-            occupation=occupation,
-            amount_usd=amount,
-            from_date=from_date,
-            to_date=to_date,
-            instrument_type=instrument,
-            suspicious_flags=flags,
-            notes=notes,
-        )
-
-        valid, errors = validate_transaction_data(payload)
-        if not valid:
-            st.error("Validation failed")
-            for err in errors:
-                st.write(f"- {err}")
-        else:
-            _submit_payload(api_client, payload)
-
-with t_batch:
-    st.info("Batch upload is available in the next release. CSV and ZIP support will be added.")
-    st.file_uploader("Upload CSV or ZIP", type=["csv", "zip"])
-    with st.expander("CSV Format Guidance"):
-        st.code("subject_name,amount_usd,from_date,to_date,instrument_type,flags")
-
-
-with t_direct:
-    st.markdown("#### Direct PDF Filing")
-    st.caption("This bypasses agent workflow and calls /api/v1/reports/file-direct.")
-
-    report_type = st.selectbox("Report Type", ["auto", "SAR", "CTR", "BOTH"])
-    input_mode = st.radio(
-        "Input Source",
-        ["Use Existing JSON Path", "Upload JSON File"],
-        horizontal=True,
-    )
-
-    json_path = ""
-    if input_mode == "Use Existing JSON Path":
-        json_path = st.text_input(
-            "JSON Path",
-            value="data/CASE-2024-677021.json",
-            help="Path must be readable from the backend process.",
-        )
-    else:
-        direct_file = st.file_uploader(
-            "Upload JSON for direct filing",
-            type=["json"],
-            key="direct_pdf_upload",
-        )
-        if direct_file is not None:
-            temp_dir = PROJECT_ROOT / "data" / "tmp"
-            temp_dir.mkdir(parents=True, exist_ok=True)
-            temp_path = temp_dir / f"direct_{direct_file.name}"
-            temp_path.write_bytes(direct_file.getvalue())
-            json_path = str(temp_path.relative_to(PROJECT_ROOT))
-            st.caption(f"Saved temporary input to `{json_path}`")
-
-    if st.button("Run Direct Filing", use_container_width=True):
-        if not json_path.strip():
-            st.warning("Provide a JSON path or upload a file.")
-        else:
-            try:
-                with st.spinner("Filing PDF directly..."):
-                    direct_result = api_client.file_report_direct(
-                        json_path=json_path.strip(),
-                        report_type=report_type,
-                    )
-                st.success("Direct filing completed")
-                st.json(direct_result)
-            except APIClientError as exc:
-                st.error(str(exc))
+_render_router_intake_workspace(api_client)
 
 _monitor_job(api_client)

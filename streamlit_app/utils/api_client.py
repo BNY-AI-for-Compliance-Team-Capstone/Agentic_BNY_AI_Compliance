@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import time
 from dataclasses import dataclass
 from typing import Any
 
@@ -24,14 +25,16 @@ class APIClient:
         self.base_url = self.base_url.rstrip("/")
         self.session = requests.Session()
         self.headers = {"Content-Type": "application/json"}
+        self._cache: dict[str, tuple[float, Any]] = {}
 
-    def _request(self, method: str, path: str, **kwargs) -> requests.Response:
+    def _request(self, method: str, path: str, attempts: int | None = None, **kwargs) -> requests.Response:
         url = f"{self.base_url}{path}"
         kwargs.setdefault("timeout", self.timeout)
         kwargs.setdefault("headers", self.headers)
 
         last_error: Exception | None = None
-        for _ in range(max(1, self.retries + 1)):
+        max_attempts = max(1, attempts if attempts is not None else (self.retries + 1))
+        for _ in range(max_attempts):
             try:
                 response = self.session.request(method, url, **kwargs)
             except requests.Timeout as exc:
@@ -70,8 +73,48 @@ class APIClient:
         except Exception:
             return {}
 
+    def _cache_get(self, key: str, ttl_seconds: int) -> Any:
+        entry = self._cache.get(key)
+        if not entry:
+            return None
+        ts, value = entry
+        if time.time() - ts > ttl_seconds:
+            return None
+        return value
+
+    def _cache_set(self, key: str, value: Any) -> Any:
+        self._cache[key] = (time.time(), value)
+        return value
+
     def health_check(self) -> dict[str, Any]:
-        return self._json(self._request("GET", "/health", headers={}))
+        # Default path now performs full dependency checks.
+        full_timeout = min(max(int(self.timeout), 1), 6)
+        try:
+            payload = self._json(
+                self._request(
+                    "GET",
+                    "/health",
+                    headers={},
+                    timeout=full_timeout,
+                    attempts=1,
+                )
+            )
+            if isinstance(payload, dict) and payload:
+                return payload
+        except APIClientError:
+            pass
+
+        # Fallback endpoint keeps UI responsive if dependencies are slow.
+        payload = self._json(
+            self._request(
+                "GET",
+                "/health/lite",
+                headers={},
+                timeout=1,
+                attempts=1,
+            )
+        )
+        return payload if isinstance(payload, dict) else {"status": "unavailable", "services": {}}
 
     def submit_case(self, case_data: dict[str, Any], report_type_hint: str | None = None) -> dict[str, Any]:
         payload: dict[str, Any] = {"transaction_data": case_data}
@@ -98,7 +141,15 @@ class APIClient:
     def list_cases(self, tracked_job_ids: list[str] | None = None, filters: dict[str, Any] | None = None) -> list[dict[str, Any]]:
         filters = filters or {}
         try:
-            payload = self._json(self._request("GET", "/api/v1/cases/list", params=filters))
+            payload = self._json(
+                self._request(
+                    "GET",
+                    "/api/v1/cases/list",
+                    params=filters,
+                    timeout=min(max(self.timeout, 1), 8),
+                    attempts=1,
+                )
+            )
             if isinstance(payload, list):
                 return payload
             return payload.get("cases", [])
@@ -176,14 +227,29 @@ class APIClient:
         return cases
 
     def get_recent_cases(self, limit: int = 10, tracked_job_ids: list[str] | None = None) -> list[dict[str, Any]]:
+        cache_key = f"recent:{limit}"
+        cached = self._cache_get(cache_key, ttl_seconds=8)
+        if cached is not None:
+            return cached
         try:
-            payload = self._json(self._request("GET", "/api/v1/cases/recent", params={"limit": limit}))
+            payload = self._json(
+                self._request(
+                    "GET",
+                    "/api/v1/cases/recent",
+                    params={"limit": limit},
+                    timeout=min(max(self.timeout, 1), 8),
+                    attempts=1,
+                )
+            )
             if isinstance(payload, list):
-                return payload[:limit]
-            return payload.get("cases", [])[:limit]
+                return self._cache_set(cache_key, payload[:limit])
+            return self._cache_set(cache_key, payload.get("cases", [])[:limit])
         except APIClientError as exc:
             if exc.status_code not in {404, 405}:
-                raise
+                cached = self._cache_get(cache_key, ttl_seconds=60)
+                if cached is not None:
+                    return cached
+                return []
         return self.list_cases(tracked_job_ids=tracked_job_ids)[:limit]
 
     def get_case_details(self, case_id: str | None = None, job_id: str | None = None) -> dict[str, Any]:
@@ -254,11 +320,36 @@ class APIClient:
         return reports
 
     def get_dashboard_metrics(self, tracked_job_ids: list[str] | None = None) -> dict[str, Any]:
+        cache_key = "dashboard_metrics"
+        cached = self._cache_get(cache_key, ttl_seconds=8)
+        if cached is not None:
+            return cached
         try:
-            return self._json(self._request("GET", "/api/v1/dashboard/metrics"))
+            payload = self._json(
+                self._request(
+                    "GET",
+                    "/api/v1/dashboard/metrics",
+                    timeout=min(max(self.timeout, 1), 4),
+                    attempts=1,
+                )
+            )
+            return self._cache_set(cache_key, payload)
         except APIClientError as exc:
             if exc.status_code not in {404, 405}:
-                raise
+                cached = self._cache_get(cache_key, ttl_seconds=60)
+                if cached is not None:
+                    return cached
+                return {
+                    "total_cases": 0,
+                    "active_cases": 0,
+                    "pending_reviews": 0,
+                    "reports_generated": 0,
+                    "avg_processing_hours": 0.0,
+                    "sar_count": 0,
+                    "ctr_count": 0,
+                    "status_distribution": {"submitted": 0, "processing": 0, "completed": 0, "failed": 0},
+                    "agent_performance": [],
+                }
 
         cases = self.list_cases(tracked_job_ids=tracked_job_ids)
         completed = [c for c in cases if c.get("status") == "completed"]

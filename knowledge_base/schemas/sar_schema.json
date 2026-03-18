@@ -3,7 +3,7 @@
   "version": "3.0",
   "effective_date": "2026-02-21",
   "form_number": "FinCEN Form 111",
-  "template_file": "knowledge_base/documents/pdf_templates/sar_report.pdf",
+  "template_file": "knowledge_base/documents/pdf_templates/fincen_sar_form_acroform.pdf",
   "description": "Normalized case-input schema used by SAR/CTR filing logic. Supports top-level array payloads.",
   "input_payload_schema": {
     "type": "array",
