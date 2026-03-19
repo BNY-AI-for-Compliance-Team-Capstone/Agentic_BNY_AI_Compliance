@@ -635,6 +635,116 @@ def _semantic_missing_field_filter(
     return [field for field in unresolved if field not in resolved_by_llm]
 
 
+def _extract_structured_fields_from_narrative(
+    narrative_text: str,
+    report_type: str,
+    schema_lookup_types: List[str],
+) -> Dict[str, Any]:
+    """
+    Use an LLM to extract structured field values from free-text narrative.
+
+    Field definitions come from the Supabase required_fields table (input_key,
+    field_label, ask_user_prompt). This keeps the router report-agnostic and
+    scalable: new report types only need rows in required_fields; no code changes.
+    """
+    field_meta: Dict[str, Dict[str, Any]] = {}
+    for rt in schema_lookup_types:
+        for meta in get_required_fields_with_prompts(rt):
+            key = str(meta.get("input_key") or "").strip()
+            if key and key not in field_meta:
+                field_meta[key] = meta
+
+    if not field_meta:
+        return {}
+
+    fields_list = [
+        {
+            "input_key": key,
+            "field_label": meta.get("field_label") or key,
+            "ask_user_prompt": (meta.get("ask_user_prompt") or "")[:200],
+        }
+        for key, meta in field_meta.items()
+    ]
+
+    api_key = str(getattr(settings, "OPENAI_API_KEY", "") or "").strip()
+    if not api_key:
+        logger.debug("OPENAI_API_KEY not set; skipping LLM extraction from narrative")
+        return {}
+
+    base_url = str(getattr(settings, "OPENAI_BASE_URL", "") or "https://api.openai.com/v1").rstrip("/")
+    model = str(getattr(settings, "OPENAI_MODEL", "") or "gpt-4o-mini").strip()
+    url = f"{base_url}/chat/completions"
+
+    system = (
+        "You extract structured data from a compliance officer's narrative. "
+        "Return a JSON object whose keys are exactly the input_key values from the field list. "
+        "For each key, set the value to what the narrative says (string or number), or null if not mentioned. "
+        "Use the field_label and ask_user_prompt to interpret what to look for. "
+        "Preserve dot-notation keys as-is (e.g. subject.first_name). "
+        "For dates use MM/DD/YYYY when possible. For amounts use numbers without currency symbols."
+    )
+    user_content = json.dumps(
+        {
+            "report_type": report_type,
+            "narrative": narrative_text[:12000],
+            "required_fields": fields_list,
+        },
+        ensure_ascii=False,
+    )
+
+    payload = {
+        "model": model,
+        "temperature": 0,
+        "messages": [
+            {"role": "system", "content": system},
+            {"role": "user", "content": user_content},
+        ],
+        "response_format": {"type": "json_object"},
+    }
+
+    try:
+        response = requests.post(
+            url,
+            headers={
+                "Authorization": f"Bearer {api_key}",
+                "Content-Type": "application/json",
+            },
+            json=payload,
+            timeout=30,
+        )
+        response.raise_for_status()
+        body = response.json()
+        content = (((body.get("choices") or [{}])[0].get("message") or {}).get("content") or "").strip()
+        parsed = json.loads(content) if content else {}
+        if not isinstance(parsed, dict):
+            return {}
+        out: Dict[str, Any] = {}
+        for key, value in parsed.items():
+            if key not in field_meta:
+                continue
+            if value is None:
+                continue
+            if isinstance(value, str) and not value.strip():
+                continue
+            out[key] = value
+        return out
+    except Exception as exc:
+        logger.warning("LLM extraction from narrative failed: {}", exc)
+        return {}
+
+
+def _merge_extracted_into_case(case_data: Dict[str, Any], extracted: Dict[str, Any]) -> None:
+    """Merge LLM-extracted key-value pairs into case_data using dot-path keys."""
+    for input_key, value in extracted.items():
+        if not isinstance(input_key, str) or not input_key.strip():
+            continue
+        if value is None:
+            continue
+        if isinstance(value, str) and not value.strip():
+            continue
+        _safe_set_nested(case_data, input_key.strip(), value)
+
+
 def _derive_case_fields(case_data: Dict[str, Any], report_type: str) -> Dict[str, Any]:
     """Fill obvious derived fields so router does not ask for redundant inputs."""
     case = normalize_case_data(case_data)
@@ -836,9 +946,9 @@ def run_router(
         )
         if hint:
             if isinstance(hint, list):
-                report_type = hint[0] if hint else "SAR"
+                report_type = str(hint[0]).strip().upper() if hint else "SAR"
             else:
-                report_type = str(hint).upper()
+                report_type = str(hint).strip().upper()
             if report_type in ("SAR", "CTR", "SANCTIONS", "BOTH"):
                 classification = {
                     "report_type": report_type,
@@ -925,25 +1035,14 @@ def run_router(
     elif isinstance(user_input, list):
         case_data = normalize_input_to_single_case(user_input)
     else:
-        # Natural language: we have no structured data to validate; ask user to provide required fields
-        case_data = {}
-        missing_fields = required_paths
-        message = (
-            f"Report type '{report_type}' is in the Knowledge Base. "
-            f"To proceed, please provide the following required information: {', '.join(required_paths)}. "
-            "You can use the manual entry form or upload a JSON file with these fields."
+        # Natural language: extract structured fields via LLM using Supabase required_fields
+        # (input_key, field_label, ask_user_prompt). Scalable for any report type.
+        narrative = str(user_input).strip()
+        case_data = normalize_case_data({"case_description": narrative})
+        extracted = _extract_structured_fields_from_narrative(
+            narrative, report_type, schema_lookup_types
         )
-        return RouterResult(
-            report_type=report_type,
-            report_types=report_types,
-            kb_status="EXISTS",
-            validated_input=case_data,
-            missing_fields=missing_fields,
-            missing_field_prompts=_prompts_for_missing(missing_fields, schema_lookup_types),
-            message=message,
-            confidence_score=confidence_score,
-            reasoning=reasoning,
-        )
+        _merge_extracted_into_case(case_data, extracted)
 
     # Reduce redundant questions by auto-filling fields derivable from existing payload.
     case_data = _derive_case_fields(case_data, report_type)
