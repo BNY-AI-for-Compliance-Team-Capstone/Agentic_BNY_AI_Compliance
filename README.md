@@ -25,9 +25,10 @@ This repository contains:
 11. [UI Usage Guide](#ui-usage-guide)
 12. [API Reference (Current)](#api-reference-current)
 13. [PDF Filing Behavior and Field Mapping Notes](#pdf-filing-behavior-and-field-mapping-notes)
-14. [Troubleshooting](#troubleshooting)
-15. [Operational Notes for Teammates](#operational-notes-for-teammates)
-16. [Security Notes](#security-notes)
+14. [PDF Filler Agent (Supabase templates)](#pdf-filler-agent-supabase-templates)
+15. [Troubleshooting](#troubleshooting)
+16. [Operational Notes for Teammates](#operational-notes-for-teammates)
+17. [Security Notes](#security-notes)
 
 ---
 
@@ -80,7 +81,7 @@ Output artifacts include:
 - FastAPI (`backend/api/main.py`, `backend/api/routes.py`)
 - Crew orchestration (`backend/orchestration/crew.py`)
 - Agents (`backend/agents/*.py`)
-- PDF tools and field mapping (`backend/tools/pdf_tools.py`, `backend/tools/field_mapper.py`)
+- PDF Filler Agent (`backend/pdf_filler/`) — Supabase-driven templates; legacy SAR/CTR tools may live under `backend/tools/` when present
 
 ### Data services
 
@@ -397,6 +398,25 @@ CTR template:
 
 - `NeedAppearances` set to improve viewer rendering
 - duplicate-page writes were removed (no double page sets)
+
+### PDF Filler Agent (Supabase templates)
+
+Deterministic **PDF Filler Agent** for any report type configured in Supabase `report_types` (`pdf_template_path` + `pdf_field_mapping`):
+
+- **Code:** `backend/pdf_filler/` — `PdfFillerAgent.fill_report(...)` or `process(payload)`.
+- **Env:** `SUPABASE_URL` + `SUPABASE_API_KEY` or `SUPABASE_ANON_KEY`.
+- **Lookup:** `report_type_code` in DB; pipeline names like `SANCTIONS_REJECT` map to `OFAC_REJECT` (see `REPORT_TYPE_ALIASES` in `metadata.py`).
+- **Mapping:** Each key is a dot path on `transaction_json` (e.g. `institution.name`, `transaction.amount_rejected`). Values may be the PDF field name (string) or `{"field_id": "...", "type": "text"}` as stored in Supabase.
+- **Narrative:** Keys `narrative` / `narrative_text` / `__narrative__` use `narrative_text` when provided, else `transaction_json.narrative`. If there is no narrative mapping entry, the agent tries PDF fields named like `narrative`, `description`, or `Page 2`.
+- **Output:** `outputs/output_<REPORT_TYPE>_<UTC_timestamp>.pdf` (see `.gitignore` for `outputs/*.pdf`).
+
+```bash
+PYTHONPATH=. python scripts/test_pdf_filler_agent.py --example ofac_reject1.json --report-type SANCTIONS_REJECT
+PYTHONPATH=. python scripts/test_pdf_filler_agent.py --example sar1.json --report-type SAR
+pytest tests/test_pdf_filler_unit.py
+```
+
+**SAR:** Pass nested case JSON like `examples/sar1.json`. The agent flattens `subject`, `institution`, `alert`, `SuspiciousActivityInformation`, and `narrative` into FinCEN-style keys (`"3"`, `"26"`, `narrative_text`, …). You can also supply a fully flat `transaction_json` with explicit keys (`"3"`, `"4"`, …) if the aggregator already emits that shape.
 
 ---
 
