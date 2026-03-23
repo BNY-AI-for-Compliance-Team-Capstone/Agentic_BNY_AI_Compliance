@@ -96,20 +96,39 @@ def _enrich_from_raw_user_input(normalized: Dict[str, Any]) -> Dict[str, Any]:
     return enriched
 
 
+def _strip_fences(text: str) -> str:
+    """Strip markdown code fences from LLM output."""
+    text = text.strip()
+    if text.startswith("```"):
+        # Remove opening fence (```json, ```JSON, ``` etc.)
+        text = text[text.index("\n") + 1:] if "\n" in text else text[3:]
+    if text.endswith("```"):
+        text = text[: text.rfind("```")].rstrip()
+    return text.strip()
+
+
 def _parse_jsonish(payload) -> Dict:
     if isinstance(payload, dict):
         return payload
     if isinstance(payload, str):
+        cleaned = _strip_fences(payload)
         try:
-            return json.loads(payload)
+            result = json.loads(cleaned)
+            if isinstance(result, dict):
+                return result
         except json.JSONDecodeError:
-            return {}
+            pass
+        return {}
     raw = getattr(payload, "raw", None)
     if isinstance(raw, str):
+        cleaned = _strip_fences(raw)
         try:
-            return json.loads(raw)
+            result = json.loads(cleaned)
+            if isinstance(result, dict):
+                return result
         except json.JSONDecodeError:
-            return {}
+            pass
+        return {}
     return {}
 
 

@@ -79,16 +79,19 @@ class KBManager:
             raise
 
     def _fetch_report_type_row(self, report_type: str) -> Optional[Dict[str, Any]]:
-        rows = self._supabase_select(
-            "report_types",
-            {
-                "select": "report_type,narrative_instructions,json_schema,validation_rules,pdf_template_path,pdf_field_mapping",
-                "report_type": f"eq.{report_type.upper()}",
-                "limit": "1",
-            },
-        )
-        if rows:
-            return rows[0]
+        code = report_type.upper()
+        attempts = [
+            {"select": "*", "report_type": f"eq.{code}", "limit": "1"},
+            {"select": "*", "report_type_code": f"eq.{code}", "limit": "1"},
+            {"select": "*", "limit": "1"},
+        ]
+        for params in attempts:
+            try:
+                rows = self._supabase_select("report_types", params)
+            except Exception:
+                continue
+            if rows:
+                return rows[0]
         return None
 
     @staticmethod
