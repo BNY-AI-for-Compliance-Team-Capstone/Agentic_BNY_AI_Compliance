@@ -1,3 +1,4 @@
+import ast
 import json
 from typing import Any, Callable, Dict
 
@@ -19,6 +20,80 @@ from backend.agents.aggregator_agent import AggregatorOrchestrator
 from backend.agents.router_agent import create_router_agent, create_router_task
 from backend.agents.narrative_agent import generate_narrative_payload
 from backend.agents.validator_agent import create_validator_agent, create_validator_task
+
+
+def _parse_raw_user_input(raw: Any) -> Dict[str, Any]:
+    """Try json.loads then ast.literal_eval on a raw_user_input string."""
+    if isinstance(raw, dict):
+        return raw
+    if not isinstance(raw, str):
+        return {}
+    text = raw.strip()
+    try:
+        result = json.loads(text)
+        if isinstance(result, dict):
+            return result
+    except (json.JSONDecodeError, ValueError):
+        pass
+    try:
+        result = ast.literal_eval(text)
+        if isinstance(result, dict):
+            return result
+    except Exception:
+        pass
+    return {}
+
+
+def _enrich_from_raw_user_input(normalized: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    If source_type is free_text, parse raw_user_input and merge the rich
+    structured fields back, overwriting the synthetic placeholders.
+    Priority fields: case_id, subject, institution, transactions,
+    SuspiciousActivityInformation (especially amount and date range).
+    """
+    if normalized.get("source_type") != "free_text":
+        return normalized
+    raw = normalized.get("raw_user_input")
+    if not raw:
+        return normalized
+
+    parsed = _parse_raw_user_input(raw)
+    if not parsed:
+        return normalized
+
+    enriched = dict(normalized)
+
+    # Merge top-level identity fields from parsed source
+    for key in ("case_id", "subject", "institution", "transactions", "narrative", "alert", "external_signals", "data_quality"):
+        val = parsed.get(key)
+        if val and (not enriched.get(key) or str(enriched.get(key, "")).startswith("CASE-TEXT") or enriched.get(key) in ("Unknown Subject", "SUB-UNKNOWN", "UNKNOWN")):
+            enriched[key] = val
+
+    # Always take subject from parsed if it has a real name
+    parsed_subject = parsed.get("subject") or {}
+    if isinstance(parsed_subject, dict) and parsed_subject.get("name") not in (None, "Unknown Subject", ""):
+        enriched["subject"] = parsed_subject
+
+    # Merge SuspiciousActivityInformation — prioritise parsed amount and date range
+    parsed_sai = parsed.get("SuspiciousActivityInformation") or {}
+    current_sai = enriched.get("SuspiciousActivityInformation") or {}
+    if isinstance(parsed_sai, dict) and parsed_sai:
+        merged_sai = dict(current_sai)
+        for field in ("26_AmountInvolved", "27_DateOrDateRange", "28_CumulativeAmount",
+                      "29_Structuring", "33_MoneyLaundering", "35_OtherSuspiciousActivities",
+                      "39_ProductTypesInvolved", "40_InstrumentTypesInvolved"):
+            if parsed_sai.get(field):
+                merged_sai[field] = parsed_sai[field]
+        enriched["SuspiciousActivityInformation"] = merged_sai
+
+    # Replace synthetic single-transaction placeholder with real transactions
+    parsed_txns = parsed.get("transactions") or []
+    current_txns = enriched.get("transactions") or []
+    synthetic = len(current_txns) == 1 and (current_txns[0] or {}).get("tx_id", "").startswith("text-")
+    if parsed_txns and synthetic:
+        enriched["transactions"] = parsed_txns
+
+    return enriched
 
 
 def _parse_jsonish(payload) -> Dict:
@@ -107,6 +182,7 @@ def create_compliance_crew(
     on_stage: Callable[[str, int], None] | None = None,
 ) -> Dict[str, dict]:
     normalized_case = normalize_case_data(transaction_data)
+    normalized_case = _enrich_from_raw_user_input(normalized_case)
     base_llm = LLM(model="gpt-4o", temperature=0.1, max_tokens=4000, api_key=settings.OPENAI_API_KEY)
 
     def mark_stage(agent: str, progress: int) -> None:

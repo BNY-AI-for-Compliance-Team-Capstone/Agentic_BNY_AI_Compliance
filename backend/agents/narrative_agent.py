@@ -73,26 +73,9 @@ def _coerce_json(value: Any) -> Any:
 def _fetch_report_type_row(report_type_code: str) -> Dict[str, Any]:
     code = (report_type_code or "SAR").upper()
     attempts = [
-        {
-            "select": "report_type,narrative_required,narrative_instructions,json_schema",
-            "report_type": f"eq.{code}",
-            "limit": "1",
-        },
-        {
-            "select": "report_type,narrative_instructions,json_schema",
-            "report_type": f"eq.{code}",
-            "limit": "1",
-        },
-        {
-            "select": "report_type_code,narrative_required,narrative_instructions,json_schema",
-            "report_type_code": f"eq.{code}",
-            "limit": "1",
-        },
-        {
-            "select": "report_type_code,narrative_instructions,json_schema",
-            "report_type_code": f"eq.{code}",
-            "limit": "1",
-        },
+        {"select": "*", "report_type": f"eq.{code}", "limit": "1"},
+        {"select": "*", "report_type_code": f"eq.{code}", "limit": "1"},
+        {"select": "*", "limit": "1"},
     ]
 
     last_exc: Exception | None = None
