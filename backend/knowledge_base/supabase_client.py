@@ -357,6 +357,29 @@ class SupabaseClient:
                 "error_message": record.error_message,
             }
 
+    def list_jobs(self, limit: int = 100, status: Optional[str] = None) -> List[Dict[str, Any]]:
+        from sqlalchemy import select, desc
+        with self._session() as session:
+            stmt = select(JobStatus).order_by(desc(JobStatus.created_at)).limit(limit)
+            if status:
+                try:
+                    stmt = stmt.where(JobStatus.status == JobStatusEnum[status])
+                except KeyError:
+                    pass
+            records = session.execute(stmt).scalars().all()
+            return [
+                {
+                    "job_id": str(r.job_id),
+                    "status": r.status.value,
+                    "current_agent": r.current_agent,
+                    "progress": r.progress,
+                    "result": r.result,
+                    "error_message": r.error_message,
+                    "created_at": r.created_at.isoformat() if r.created_at else None,
+                }
+                for r in records
+            ]
+
     def add_field_mapping(self, data: Dict[str, Any]) -> uuid.UUID:
         with self._session() as session:
             record = FieldMapping(
