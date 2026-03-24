@@ -1,0 +1,9 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python3:*)",
+      "Bash(source .venv/bin/activate)",
+      "Bash(find /Users/tusunaiturumbekova/Desktop/Capstone/Agentic_BNY_AI_Compliance/data -type f -not -path */__pycache__/*)"
+    ]
+  }
+}
