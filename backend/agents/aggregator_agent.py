@@ -775,7 +775,7 @@ class MultiReportAggregator:
         if report_type == "SAR":
             for field in ["customer_ssn", "customer_address", "customer_dob"]:
                 if not data.get(field):
-                    issues.append(f"Critical field missing: {field}")
+                    issues.append(f"Data quality note: {field} not provided (obtain if available)")
             for index, tx in enumerate(data.get("transactions", []), start=1):
                 tx_dict = tx if isinstance(tx, dict) else tx.model_dump()
                 if not tx_dict.get("counterparty"):
@@ -795,11 +795,8 @@ class MultiReportAggregator:
         risk_flags: List[RiskFlag],
         missing_required: List[str],
     ) -> tuple[bool, Optional[str]]:
-        if isinstance(schema_narrative_required, bool):
-            if schema_narrative_required:
-                return True, "Narrative required by report schema configuration"
-            return False, "Narrative not required by report schema configuration"
-
+        # SAR always requires a narrative per FinCEN 31 CFR § 1020.320.
+        # Schema config cannot override this — check SAR first before consulting Supabase.
         if report_type == "SAR":
             reasons = ["SAR filing requires narrative explanation"]
             high_risk = [flag for flag in risk_flags if flag.severity in {"high", "critical"}]
@@ -808,6 +805,11 @@ class MultiReportAggregator:
             if missing_required:
                 reasons.append("Data gaps require explanatory narrative")
             return True, "; ".join(reasons)
+
+        if isinstance(schema_narrative_required, bool):
+            if schema_narrative_required:
+                return True, "Narrative required by report schema configuration"
+            return False, "Narrative not required by report schema configuration"
 
         return False, None
 

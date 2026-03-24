@@ -9,6 +9,7 @@ from backend.tools.kb_tools import (
     get_validation_rules_tool,
 )
 from backend.tools.pdf_tools import CTRReportFiler, SARReportFiler
+from backend.pdf_filler.agent import PdfFillerAgent
 from backend.tools.field_mapper import (
     calculate_total_cash_amount,
     determine_report_types,
@@ -35,12 +36,22 @@ def _parse_raw_user_input(raw: Any) -> Dict[str, Any]:
             return result
     except (json.JSONDecodeError, ValueError):
         pass
-    try:
-        result = ast.literal_eval(text)
-        if isinstance(result, dict):
-            return result
-    except Exception:
-        pass
+    # Extract just the dict portion (first { to last }) before ast.literal_eval
+    # so trailing prose or formatted text after the closing brace doesn't break parsing.
+    first_brace = text.find("{")
+    last_brace = text.rfind("}")
+    candidates = [text]
+    if first_brace != -1 and last_brace > first_brace:
+        extracted = text[first_brace : last_brace + 1]
+        if extracted != text:
+            candidates.insert(0, extracted)
+    for candidate in candidates:
+        try:
+            result = ast.literal_eval(candidate)
+            if isinstance(result, dict):
+                return result
+        except Exception:
+            pass
     return {}
 
 
@@ -191,9 +202,164 @@ def _normalize_report_types(value: Any) -> list[str]:
     out: list[str] = []
     for item in raw:
         report_type = str(item or "").upper()
-        if report_type in {"SAR", "CTR"} and report_type not in out:
+        if report_type in {"SAR", "CTR", "OFAC_REJECT"} and report_type not in out:
             out.append(report_type)
     return out
+
+
+def _is_ofac_case(case: Dict[str, Any]) -> bool:
+    """Return True when the case payload is an OFAC rejection report."""
+    if str(case.get("report_type_code", "")).upper() == "OFAC_REJECT":
+        return True
+
+    # Accept both 'transaction' (legacy) and 'transaction_information' (OFAC form layout)
+    txn = case.get("transaction") or case.get("transaction_information")
+    if isinstance(txn, dict) and txn.get("date_of_rejection"):
+        # Legacy: paired with case_facts / sanctions_program
+        if case.get("case_facts") or case.get("sanctions_program"):
+            return True
+        # OFAC form layout: rejection reason field often contains "OFAC" or "SDN"
+        reason = str(txn.get("program_or_reason_for_rejecting_funds", "")).upper()
+        if "OFAC" in reason or "SDN" in reason or "SANCTION" in reason:
+            return True
+        # Has originator + beneficiary_financial_institution → wire rejection pattern
+        if case.get("originator") and case.get("beneficiary_financial_institution"):
+            return True
+
+    return False
+
+
+def _build_ofac_aggregator_output(case: Dict[str, Any]) -> Dict[str, Any]:
+    """Build a minimal aggregator-style output for OFAC rejection cases.
+
+    Handles two payload shapes:
+    - Legacy: keys transaction / institution / case_facts / preparer / sanctions_program
+    - OFAC form layout: keys transaction_information / institution_information /
+      originator / beneficiary_financial_institution / preparer_information
+    """
+    # transaction block — accept both key names
+    txn = case.get("transaction") or case.get("transaction_information") or {}
+    # institution block — accept both key names
+    inst = case.get("institution") or case.get("institution_information") or {}
+    facts = case.get("case_facts") or {}
+    # preparer block — accept both key names
+    preparer = case.get("preparer") or case.get("preparer_information") or {}
+
+    # Sanctions program — may live at top level or inside the rejection reason
+    sanctions_program = (
+        case.get("sanctions_program")
+        or txn.get("sanctions_program")
+        or txn.get("program_or_reason_for_rejecting_funds")
+        or ""
+    )
+
+    # Beneficiary FI — legacy field or dedicated key
+    beneficiary_fi_obj = case.get("beneficiary_financial_institution") or {}
+    beneficiary_fi = (
+        txn.get("beneficiary_fi")
+        or (beneficiary_fi_obj.get("name") if isinstance(beneficiary_fi_obj, dict) else "")
+        or ""
+    )
+
+    # Originator
+    originator_obj = case.get("originator") or {}
+    originator_name = originator_obj.get("name", "") if isinstance(originator_obj, dict) else ""
+
+    # Amount rejected — may be keyed differently
+    amount_rejected = txn.get("amount_rejected") or txn.get("amount_rejected_usd") or ""
+
+    # Institution name
+    inst_name = inst.get("name") or inst.get("institution") or ""
+
+    # Preparer
+    preparer_name = preparer.get("name") or preparer.get("name_of_signer") or ""
+    preparer_title = preparer.get("title") or preparer.get("title_of_signer") or ""
+
+    return {
+        "report_type": "OFAC_REJECT",
+        "case_id": case.get("case_id", "UNKNOWN"),
+        "narrative_required": True,
+        "narrative_justification": "OFAC rejection reports require a narrative per 31 C.F.R. Part 501",
+        "missing_required_fields": [],
+        "data_quality_issues": [],
+        "risk_score": 1.0,
+        "risk_flags": [],
+        "institution_name": inst_name,
+        "amount_rejected": amount_rejected,
+        "currency": txn.get("currency", "USD"),
+        "sanctions_program": sanctions_program,
+        "transaction_type": txn.get("transaction_type", ""),
+        "date_of_rejection": txn.get("date_of_rejection", ""),
+        "beneficiary_fi": beneficiary_fi,
+        "originator_name": originator_name,
+        "disposition": facts.get("disposition", ""),
+        "documents_reviewed": facts.get("documents_reviewed", []),
+        "preparer_name": preparer_name,
+        "preparer_title": preparer_title,
+    }
+
+
+def _build_ofac_pdf_payload(case: Dict[str, Any], aggregator_output: Dict[str, Any]) -> Dict[str, Any]:
+    """Build transaction_json with nested keys matching the OFAC_REJECT Supabase PDF mapping.
+
+    The fill_engine resolves dot-paths like 'institution.name' as data['institution']['name'].
+    The raw OFAC case uses 'institution_information', 'transaction_information', etc., so we
+    remap everything here into the expected shape.
+    """
+    inst = case.get("institution_information") or case.get("institution") or {}
+    txn = case.get("transaction_information") or case.get("transaction") or {}
+    prep = case.get("preparer_information") or case.get("preparer") or {}
+    originator = case.get("originator") or {}
+    originating_fi = case.get("originating_financial_institution") or {}
+    intermediary_fis = case.get("intermediary_financial_institutions") or []
+    bene_fi_obj = case.get("beneficiary_financial_institution") or {}
+    beneficiary = case.get("beneficiary") or {}
+
+    def _name_addr(obj: Any) -> str:
+        if not isinstance(obj, dict):
+            return ""
+        name = obj.get("name", "")
+        addr = obj.get("address", "")
+        return f"{name}\n{addr}".strip() if addr else name
+
+    intermediary_parts = [
+        _name_addr(fi) for fi in (intermediary_fis if isinstance(intermediary_fis, list) else [])
+        if isinstance(fi, dict) and fi.get("name")
+    ]
+
+    return {
+        "institution": {
+            "name": inst.get("institution") or inst.get("name") or aggregator_output.get("institution_name", ""),
+            "type": inst.get("type_of_institution") or inst.get("type", ""),
+            "address": inst.get("address", ""),
+            "city": inst.get("city", ""),
+            "state": inst.get("state", ""),
+            "postal_code": inst.get("postal_code", ""),
+            "country": inst.get("country", ""),
+            "contact_person": inst.get("contact_person", ""),
+            "telephone": inst.get("telephone_number") or inst.get("telephone", ""),
+            "email": inst.get("email_address") or inst.get("email", ""),
+            "fax": inst.get("fax_number") or inst.get("fax", ""),
+        },
+        "transaction": {
+            "amount_rejected": str(txn.get("amount_rejected") or txn.get("amount_rejected_usd") or aggregator_output.get("amount_rejected", "")),
+            "date_of_transaction": txn.get("date_of_transaction", ""),
+            "date_of_rejection": txn.get("date_of_rejection") or aggregator_output.get("date_of_rejection", ""),
+            "program_or_reason": txn.get("program_or_reason_for_rejecting_funds") or aggregator_output.get("sanctions_program", ""),
+            "originator_name_address": _name_addr(originator) or aggregator_output.get("originator_name", ""),
+            "originating_fi": _name_addr(originating_fi),
+            "intermediary_fi": "\n".join(intermediary_parts),
+            "beneficiary_fi": _name_addr(bene_fi_obj) or aggregator_output.get("beneficiary_fi", ""),
+            "beneficiary_name_address": _name_addr(beneficiary),
+            "additional_relevant_info": case.get("additional_relevant_information", ""),
+            "additional_data": case.get("additional_data_in_payment_message", ""),
+        },
+        "preparer": {
+            "name": prep.get("name_of_signer") or prep.get("name") or aggregator_output.get("preparer_name", ""),
+            "title": prep.get("title_of_signer") or prep.get("title") or aggregator_output.get("preparer_title", ""),
+            "date_prepared": prep.get("date_prepared", ""),
+        },
+    }
 
 
 def create_compliance_crew(
@@ -212,37 +378,58 @@ def create_compliance_crew(
         except Exception:
             pass
 
+    # --- OFAC detection (deterministic, no LLM needed) ---
+    is_ofac = _is_ofac_case(normalized_case)
+
     router_output: Dict[str, Any] = {}
-    try:
-        # Agent 1 (Router) executed via CrewAI; tools intentionally disabled to
-        # prevent tool-loop failures and keep routing stable.
+    if is_ofac:
         mark_stage("router", 15)
-        router_agent = create_router_agent(llm=base_llm, tools=[])
-        router_task = create_router_task(router_agent, normalized_case)
-        router_crew = Crew(
-            agents=[router_agent],
-            tasks=[router_task],
-            process=Process.sequential,
-            verbose=True,
-        )
-        router_result = router_crew.kickoff()
-        router_output = _parse_jsonish(router_result)
-    except Exception as exc:
-        router_output = {"router_error": str(exc)}
+        router_output = {
+            "report_types": ["OFAC_REJECT"],
+            "report_type": "OFAC_REJECT",
+            "confidence_score": 1.0,
+            "reasoning": "OFAC sanctions rejection case detected from input fields (report_type_code or date_of_rejection + case_facts).",
+            "kb_status": "EXISTS",
+        }
+    else:
+        try:
+            # Agent 1 (Router) executed via CrewAI; tools intentionally disabled to
+            # prevent tool-loop failures and keep routing stable.
+            mark_stage("router", 15)
+            router_agent = create_router_agent(llm=base_llm, tools=[])
+            router_task = create_router_task(router_agent, normalized_case)
+            router_crew = Crew(
+                agents=[router_agent],
+                tasks=[router_task],
+                process=Process.sequential,
+                verbose=True,
+            )
+            router_result = router_crew.kickoff()
+            router_output = _parse_jsonish(router_result)
+        except Exception as exc:
+            router_output = {"router_error": str(exc)}
 
     total_cash_amount = calculate_total_cash_amount(normalized_case)
     suspicious = has_suspicious_activity(normalized_case)
-    report_types = _normalize_report_types(router_output.get("report_types"))
-    if not report_types:
-        report_types = determine_report_types(normalized_case)
+    if is_ofac:
+        report_types = ["OFAC_REJECT"]
+    else:
+        report_types = _normalize_report_types(router_output.get("report_types"))
+        if not report_types:
+            report_types = determine_report_types(normalized_case)
+        # If the Router identified OFAC_REJECT but deterministic detection missed it,
+        # promote is_ofac now so the correct OFAC branch runs downstream.
+        if "OFAC_REJECT" in report_types:
+            is_ofac = True
+            report_types = ["OFAC_REJECT"]
     router_output["report_types"] = report_types
     router_output["total_cash_amount"] = total_cash_amount
-    router_output["reasoning"] = _build_router_reasoning(total_cash_amount, suspicious, report_types)
+    if not is_ofac:
+        router_output["reasoning"] = _build_router_reasoning(total_cash_amount, suspicious, report_types)
     router_output.setdefault("confidence_score", 1.0 if report_types else 0.0)
     router_output.setdefault("kb_status", "EXISTS")
     if report_types:
-        # Keep legacy key for downstream prompts expecting one report type.
-        router_output["report_type"] = "SAR" if "SAR" in report_types else report_types[0]
+        router_output["report_type"] = "OFAC_REJECT" if is_ofac else ("SAR" if "SAR" in report_types else report_types[0])
     else:
         router_output["report_type"] = "NONE"
 
@@ -262,30 +449,41 @@ def create_compliance_crew(
 
     # Researcher (Agent 2) intentionally skipped per workflow requirement.
 
-    aggregator = AggregatorOrchestrator(llm=base_llm)
     aggregated_by_type: Dict[str, Dict[str, Any]] = {}
     mark_stage("aggregator", 35)
-    for report_type in report_types:
-        aggregated = aggregator.process(
-            raw_data=normalized_case,
-            report_type=report_type,
-            case_id=normalized_case.get("case_id") if isinstance(normalized_case, dict) else None,
-        )
-        aggregated_by_type[report_type] = aggregated.model_dump(mode="json")
+    if is_ofac:
+        aggregated_by_type["OFAC_REJECT"] = _build_ofac_aggregator_output(normalized_case)
+    else:
+        aggregator = AggregatorOrchestrator(llm=base_llm)
+        for report_type in report_types:
+            aggregated = aggregator.process(
+                raw_data=normalized_case,
+                report_type=report_type,
+                case_id=normalized_case.get("case_id") if isinstance(normalized_case, dict) else None,
+            )
+            aggregated_by_type[report_type] = aggregated.model_dump(mode="json")
 
-    primary_report_type = "SAR" if "SAR" in aggregated_by_type else report_types[0]
+    primary_report_type = "OFAC_REJECT" if is_ofac else ("SAR" if "SAR" in aggregated_by_type else report_types[0])
     aggregator_output: Dict[str, Any] = aggregated_by_type[primary_report_type]
 
     narrative_output: Dict[str, Any] = {}
-    sar_aggregate = aggregated_by_type.get("SAR")
-    if isinstance(sar_aggregate, dict) and sar_aggregate.get("narrative_required", True):
+    if is_ofac:
         mark_stage("narrative", 55)
-        narrative_input = _build_narrative_input(normalized_case, sar_aggregate)
         narrative_output = generate_narrative_payload(
-            narrative_input,
-            report_type_code="SAR",
+            normalized_case,
+            report_type_code="OFAC_REJECT",
             verbose=True,
         )
+    else:
+        sar_aggregate = aggregated_by_type.get("SAR")
+        if isinstance(sar_aggregate, dict) and sar_aggregate.get("narrative_required", True):
+            mark_stage("narrative", 55)
+            narrative_input = _build_narrative_input(normalized_case, sar_aggregate)
+            narrative_output = generate_narrative_payload(
+                narrative_input,
+                report_type_code="SAR",
+                verbose=True,
+            )
 
     mark_stage("validator", 75)
     if settings.SKIP_VALIDATOR_FOR_TESTING:
@@ -319,18 +517,29 @@ def create_compliance_crew(
         # Deterministic filing avoids LLM-output parsing risk for final artifacts.
         mark_stage("filer", 90)
         reports = []
-        if "CTR" in report_types:
-            reports.append(CTRReportFiler().fill_from_dict(normalized_case))
-        if "SAR" in report_types:
-            sar_case = dict(normalized_case)
-            narrative_text = (
-                narrative_output.get("narrative_text")
-                or narrative_output.get("narrative")
-                or narrative_output.get("text")
+        narrative_text = (
+            narrative_output.get("narrative_text")
+            or narrative_output.get("narrative")
+            or narrative_output.get("text")
+        )
+        if is_ofac:
+            # Build a payload with nested keys matching the Supabase OFAC_REJECT PDF mapping
+            # (fill_engine resolves 'institution.name' as data['institution']['name']).
+            ofac_payload = _build_ofac_pdf_payload(normalized_case, aggregator_output)
+            result = PdfFillerAgent().fill_report(
+                report_type_name="OFAC_REJECT",
+                transaction_json=ofac_payload,
+                narrative_text=narrative_text,
             )
-            if narrative_text:
-                sar_case["narrative"] = narrative_text
-            reports.append(SARReportFiler().fill_from_dict(sar_case))
+            reports.append({**result.to_dict(), "report_type": "OFAC_REJECT"})
+        else:
+            if "CTR" in report_types:
+                reports.append(CTRReportFiler().fill_from_dict(normalized_case))
+            if "SAR" in report_types:
+                sar_case = dict(normalized_case)
+                if narrative_text:
+                    sar_case["narrative"] = narrative_text
+                reports.append(SARReportFiler().fill_from_dict(sar_case))
         final_output = reports[0] if len(reports) == 1 else {"status": "success", "reports": reports}
     else:
         final_output = {

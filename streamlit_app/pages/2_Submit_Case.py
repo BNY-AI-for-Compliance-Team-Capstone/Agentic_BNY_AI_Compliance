@@ -25,6 +25,8 @@ from streamlit_app.utils.session_state import add_tracked_job, init_session_stat
 from streamlit_app.utils.validators import (
     build_manual_case_payload,
     build_text_case_payload,
+    identify_missing_intake_fields,
+    merge_intake_answers,
     validate_transaction_data,
 )
 
@@ -377,18 +379,113 @@ t_text, t_upload, t_manual, t_batch, t_direct = st.tabs(
 
 with t_text:
     st.markdown("#### Free-Text Case Intake")
-    subject_name = st.text_input("Subject Name", value="Unknown Subject", key="text_subject_name")
-    free_text = st.text_area(
-        "Case Description",
-        height=220,
-        placeholder="Describe transactions and patterns. The system will classify filing requirements.",
-    )
-    if st.button("Submit Text Case", use_container_width=True):
-        if not free_text.strip():
-            st.warning("Enter case text before submitting.")
-        else:
-            payload = build_text_case_payload(free_text, subject_name=subject_name)
-            _submit_payload(api_client, payload)
+
+    # ── Session-state keys for multi-step intake ──────────────────────────
+    if "text_intake_step" not in st.session_state:
+        st.session_state["text_intake_step"] = "input"   # "input" | "collecting" | "ready"
+    if "text_intake_case" not in st.session_state:
+        st.session_state["text_intake_case"] = {}
+    if "text_intake_missing" not in st.session_state:
+        st.session_state["text_intake_missing"] = []
+
+    step = st.session_state["text_intake_step"]
+
+    # ── Step 1 — initial case description ────────────────────────────────
+    if step == "input":
+        free_text = st.text_area(
+            "Case Description",
+            height=220,
+            placeholder="Paste a JSON case or describe the suspicious activity. The system will extract what it can and ask for anything missing.",
+        )
+        if st.button("Analyze Case", use_container_width=True):
+            if not free_text.strip():
+                st.warning("Enter case text before analyzing.")
+            else:
+                partial = build_text_case_payload(free_text)
+                missing = identify_missing_intake_fields(partial)
+                st.session_state["text_intake_case"] = partial
+                st.session_state["text_intake_missing"] = missing
+                st.session_state["text_intake_step"] = "collecting" if missing else "ready"
+                st.rerun()
+
+    # ── Step 2 — collect missing required fields ──────────────────────────
+    elif step == "collecting":
+        partial = st.session_state["text_intake_case"]
+        missing_fields = st.session_state["text_intake_missing"]
+
+        with st.chat_message("assistant"):
+            subject_name = (partial.get("subject") or {}).get("name") or ""
+            detected_lines = []
+            sai = partial.get("SuspiciousActivityInformation") or {}
+            amount = (sai.get("26_AmountInvolved") or {}).get("amount_usd") or 0
+            dr = sai.get("27_DateOrDateRange") or {}
+            if subject_name and subject_name not in ("Subject Unknown", "Unknown Subject"):
+                detected_lines.append(f"**Subject:** {subject_name}")
+            if amount:
+                detected_lines.append(f"**Amount involved:** ${amount:,.2f}")
+            if dr.get("from") and dr.get("to"):
+                detected_lines.append(f"**Activity period:** {dr['from']} – {dr['to']}")
+            act_cats = [
+                k.split("_", 1)[-1].replace("_", " ")
+                for k in ("29_Structuring", "30_TerroristFinancing", "31_Fraud", "33_MoneyLaundering")
+                if sai.get(k)
+            ]
+            if act_cats:
+                detected_lines.append(f"**Activity categories:** {', '.join(act_cats)}")
+
+            if detected_lines:
+                st.markdown("I've extracted the following from your input:\n\n" + "\n\n".join(detected_lines))
+            st.markdown(
+                "To complete the FinCEN filing I need a few more details. "
+                "Please fill in the fields below:"
+            )
+
+        with st.form("intake_missing_fields_form"):
+            answers: dict[str, str] = {}
+            for field in missing_fields:
+                answers[field["key"]] = st.text_input(
+                    field["label"],
+                    placeholder=field.get("placeholder", ""),
+                    key=f"intake_{field['key']}",
+                )
+
+            col_submit, col_reset = st.columns([3, 1])
+            with col_submit:
+                submitted = st.form_submit_button("Complete & Submit", use_container_width=True)
+            with col_reset:
+                reset = st.form_submit_button("Start Over", use_container_width=True)
+
+            if reset:
+                st.session_state["text_intake_step"] = "input"
+                st.rerun()
+
+            if submitted:
+                # Check required fields are filled
+                required_missing = [
+                    f["label"] for f in missing_fields
+                    if f.get("required") and not (answers.get(f["key"]) or "").strip()
+                ]
+                if required_missing:
+                    st.error("Please fill in the required fields:\n- " + "\n- ".join(required_missing))
+                else:
+                    complete_case = merge_intake_answers(partial, answers)
+                    st.session_state["text_intake_step"] = "input"
+                    _submit_payload(api_client, complete_case)
+
+    # ── Step 3 — all fields present, submit directly ──────────────────────
+    elif step == "ready":
+        partial = st.session_state["text_intake_case"]
+        with st.chat_message("assistant"):
+            st.markdown("All required fields are present. Ready to submit.")
+        col_go, col_back = st.columns([3, 1])
+        with col_go:
+            if st.button("Submit Case", use_container_width=True):
+                st.session_state["text_intake_step"] = "input"
+                _submit_payload(api_client, partial)
+        with col_back:
+            if st.button("Start Over", use_container_width=True):
+                st.session_state["text_intake_step"] = "input"
+                st.rerun()
 
 with t_upload:
     uploaded = st.file_uploader("Upload case JSON", type=["json"])

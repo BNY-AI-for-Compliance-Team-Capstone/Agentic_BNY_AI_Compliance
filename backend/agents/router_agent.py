@@ -7,18 +7,19 @@ from crewai import LLM
 def create_router_agent(llm: LLM, tools: list) -> Agent:
     return Agent(
         role="Report Type Classifier",
-        goal="Accurately determine which report(s) are required (SAR, CTR, or BOTH) based on transaction data",
-        backstory="""You are an expert compliance analyst with 15 years of experience 
-        in banking regulations. You specialize in identifying suspicious activity patterns 
-        and determining the appropriate regulatory reporting requirements. You understand 
+        goal="Accurately determine which report(s) are required (SAR, CTR, OFAC_REJECT, or combinations) based on transaction data",
+        backstory="""You are an expert compliance analyst with 15 years of experience
+        in banking regulations. You specialize in identifying suspicious activity patterns
+        and determining the appropriate regulatory reporting requirements. You understand
         the Bank Secrecy Act, FinCEN requirements, and OFAC sanctions regulations intimately.
 
         Your expertise includes:
         - Recognizing structuring patterns (multiple transactions just under $10,000)
         - Determining when CTR filing is required (cash transactions >= $10,000)
+        - Identifying OFAC sanctions rejection cases (rejected/blocked payments due to sanctions hits)
         - Distinguishing between standard threshold reporting and suspicious behavior
 
-        You are meticulous and never make classification errors, as the wrong report 
+        You are meticulous and never make classification errors, as the wrong report
         type could lead to regulatory violations.""",
         tools=tools,
         llm=llm,
@@ -37,7 +38,7 @@ def create_router_task(agent: Agent, transaction_data: dict) -> Task:
         {json.dumps(transaction_data, indent=2)}
 
         Output a JSON object with:
-        - report_types: ["SAR"], ["CTR"], ["CTR","SAR"], or []
+        - report_types: ["SAR"], ["CTR"], ["CTR","SAR"], ["OFAC_REJECT"], or []
         - confidence_score: float between 0 and 1
         - total_cash_amount: float
         - reasoning: concise factual explanation
@@ -45,9 +46,12 @@ def create_router_task(agent: Agent, transaction_data: dict) -> Task:
         - narrative_description: 2-4 factual sentences
 
         Classification policy:
-        - SAR when suspicious activity indicators exist
-        - CTR when total cash activity >= 10,000
-        - BOTH when both conditions apply
+        - OFAC_REJECT when the case involves a rejected/blocked transaction due to OFAC sanctions
+          (look for: report_type_code="OFAC_REJECT", date_of_rejection, sanctions_program,
+          beneficiary_fi in a sanctioned country, or case_facts.disposition containing "Rejected")
+        - SAR when suspicious activity indicators exist (structuring, fraud, money laundering, etc.)
+        - CTR when total cash activity >= $10,000
+        - BOTH (CTR + SAR) when both conditions apply
         - [] when neither applies
 
         Return JSON only.

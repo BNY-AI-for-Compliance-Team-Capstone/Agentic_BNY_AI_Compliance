@@ -51,6 +51,16 @@ def create_validator_task(agent: Agent, aggregator_output: dict, narrative_outpu
         4. Check narrative quality: clarity, completeness, tone, specificity, length
         5. Assign final status (APPROVED, NEEDS_REVIEW, REJECTED)
         6. Provide actionable feedback
+
+        IMPORTANT GUIDANCE:
+        - The "data_quality_issues" field in the Case Summary contains informational notes from the data mapper,
+          NOT hard validation failures. These are flags for human review but do NOT block filing on their own.
+        - Only block filing (NEEDS_REVIEW/REJECTED) if the validation rules you retrieve explicitly require
+          a field that is truly absent and cannot be inferred from context.
+        - A SAR with a complete narrative, valid activity dates, amount, subject identity, and suspicious
+          activity categories SHOULD be APPROVED even if optional demographic fields (SSN, DOB) are missing.
+        - APPROVE if: narrative exists, activity dates present, amount present, at least one suspicious
+          activity category checked, and institution name present.
         """,
         expected_output="""JSON object with:
     {

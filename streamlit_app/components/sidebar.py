@@ -1,14 +1,29 @@
 """Sidebar navigation and health widget."""
 
 from __future__ import annotations
+from pathlib import Path
 
 import streamlit as st
 
 from streamlit_app.utils.api_client import APIClient, APIClientError
 
+_PROJECT_ROOT = Path(__file__).resolve().parents[2]
+
+
+def _sidebar_logo() -> Path | None:
+    for name in ("logo.jpg", "logo.png", "logo.jpeg"):
+        p = _PROJECT_ROOT / "img" / name
+        if p.exists():
+            return p
+    return None
+
 
 def render_sidebar(api_client: APIClient) -> None:
     with st.sidebar:
+        logo = _sidebar_logo()
+        if logo:
+            st.image(str(logo), width=220)
+            st.markdown("---")
         st.markdown("## Navigation")
         # Paths must be relative to the Streamlit main script directory.
         st.page_link("app.py", label="Home")

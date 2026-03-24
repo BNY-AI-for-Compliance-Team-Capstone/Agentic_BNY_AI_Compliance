@@ -95,6 +95,7 @@ class SARFieldMapper:
         fields: Dict[str, str] = {}
         variant = (template_variant or "legacy").strip().lower()
         if variant == "fincen_acroform":
+            fields.update(self._map_suspicious_activity())
             fields.update(self._map_fincen_acroform())
         elif variant == "all":
             fields.update(self._map_institution())
@@ -577,22 +578,145 @@ class SARFieldMapper:
             or (self.inst.get("postal_code", "") or "").strip()
         )
         inst_address = (self.inst.get("address", "") or "").strip()
-        if not inst_address:
-            inst_address = self._compose_address_line(inst_city, inst_state, inst_zip)
 
-        f["53  Legal name of financial institution a  Unk"] = self.inst.get("name", "")
-        f["55  TIN a  Unk"] = self.inst.get("ein", "")
+        # Subject state (FinCEN SAR item 10)
+        f["10 State"] = subject_state
+
+        # Subject TIN type checkbox (item 14) — check EIN or SSN/ITIN based on subject type
+        if subject_tin:
+            has_ssn = bool(self.subject.get("ssn"))
+            f["EIN"] = "/Yes" if not has_ssn else "/Off"
+            f["SSNITIN"] = "/Yes" if has_ssn else "/Off"
+
+        # Item 1 — Initial filing type
+        f["2  Check  a"] = "/Yes"
+
+        # -----------------------------------------------------------------
+        # Part III — Financial Institution Where Activity Occurred
+        # -----------------------------------------------------------------
+        # Institution type: Depository institution (item 47)
+        f["Depository institution"] = "/Yes"
+
+        # Primary federal regulator (item 48) — best-effort from case data
+        regulator = (self.inst.get("primary_federal_regulator", "") or "").strip().upper()
+        REGULATOR_FIELD = {
+            "FRB": "a_10", "FEDERAL RESERVE": "a_10",
+            "FDIC": "a_11",
+            "NCUA": "a_12",
+            "OCC": "a_13",
+            "OTS": "a_14",
+        }
+        reg_field = REGULATOR_FIELD.get(regulator)
+        if reg_field:
+            f[reg_field] = "/Yes"
+
+        inst_name = (self.inst.get("name", "") or "BNY Mellon").strip()
+        inst_ein = (self.inst.get("ein", "") or "13-4941247").strip()
+        if not inst_city:
+            inst_city = "New York"
+        if not inst_state:
+            inst_state = "NY"
+        if not inst_zip:
+            inst_zip = "10286"
+        if not inst_address:
+            inst_address = "240 Greenwich Street"
+
+        f["53  Legal name of financial institution a  Unk"] = inst_name
+        f["21a  Institution  TIN"] = inst_ein
+        f["55  TIN a  Unk"] = inst_ein
+        # Institution TIN type — EIN
+        f["EIN_2"] = "/Yes"
         f["57  Address a  Unk"] = inst_address
         f["58  City a  Unk"] = inst_city
         f["59 State"] = inst_state
         f["60  ZIPPostal Code"] = inst_zip
 
-        contact_name = self.inst.get("contact_officer", "") or ""
-        f["79 Filer name"] = contact_name
-        f[" 96 Filing institution contact office"] = "Compliance Office"
-        f["97  Filing institution contact office phone number Include Area Code"] = (
-            self._normalize_phone(self.inst.get("contact_phone", ""))
-        )
+        # Branch / office where activity occurred (items 65–70)
+        f["65  Address of branch or office where activity occurred If no branch activity involved check this box a"] = inst_address
+        f["67  City"] = inst_city
+        f["68  State"] = inst_state
+        f["69  ZIPPostal Code"] = inst_zip
+        f["70  Country 2letter code"] = (self.inst.get("country", "US") or "US").strip().upper()[:2]
+
+        # RSSD identifier (item 66) — optional but included when provided
+        rssd = str(self.inst.get("rssd", "") or "").strip()
+        if rssd:
+            f["66  RSSD number"] = rssd
+
+        # Internal control / file number (item 62)
+        case_id = str(self.case.get("case_id", "") or "").strip()
+        if case_id:
+            f["62  Internal controlfile number"] = case_id
+            f["91  Internal controlfile number"] = case_id
+
+        # -----------------------------------------------------------------
+        # Part IV — Filing Institution Contact Information (static defaults)
+        # These fields represent the filing institution (BNY Mellon) and
+        # do not change per-case. Case-level institution data is preferred;
+        # BNY Mellon data is used as fallback so the form is never blank.
+        # -----------------------------------------------------------------
+        # Institution type for filer (item 78)
+        f["Depository institution_2"] = "/Yes"
+
+        # Item 79 — Legal name of filing institution
+        f["79 Filer name"] = inst_name
+
+        # Item 80 — TIN of filing institution
+        f["80  TIN"] = inst_ein
+
+        # Item 81 — TIN type: EIN
+        f["EIN_2"] = "/Yes"
+
+        # Items 85–88 — Filing institution address
+        # NOTE: do NOT set "85  AddressRow1" — that field renders in the
+        # item 89 (Country) cell position and would corrupt the country value.
+        f["85  Address"] = inst_address
+        f["86  City"] = inst_city
+        f["87 State"] = inst_state
+        f["88 Zip postal code"] = inst_zip
+
+        # Item 96 — Contact office (static)
+        contact_officer = (self.inst.get("contact_officer", "") or "").strip()
+        f[" 96 Filing institution contact office"] = contact_officer or "Financial Intelligence Unit"
+
+        # Item 97 — Contact phone
+        raw_phone = self.inst.get("contact_phone", "") or ""
+        normalized_phone = self._normalize_phone(raw_phone)
+        if len(normalized_phone) < 10:
+            normalized_phone = "2125956009"
+        f["97  Filing institution contact office phone number Include Area Code"] = normalized_phone
+
+        # ----------------------------------------------------------------
+        # Item 26 — Amount involved in this report
+        # The AcroForm uses shared field names across digit cells:
+        #   Text2 → cells 1-2 (both same digit; leading zeros for < $100B)
+        #   Text7 → cell 3  (billions)
+        #   Text10 → cell 4 (hundred millions)
+        #   Text8  → cell 5 (ten millions)
+        #   Text9  → cells 6-12 (7 cells, all same digit)
+        # The same fields also appear in items 28 and 63 (loss), so setting
+        # them is approximate for non-round amounts — the narrative carries
+        # the exact figure.
+        # ----------------------------------------------------------------
+        amount_val = self._resolve_amount_involved()
+        if amount_val > 0:
+            amount_int = min(int(round(amount_val)), 999_999_999_999)
+            digits = str(amount_int).zfill(12)
+            f["Text2"] = digits[0]   # cells 1-2 same digit (leading zero < $100B)
+            f["Text7"] = digits[2]   # cell 3 — billions
+            f["Text10"] = digits[3]  # cell 4 — hundred millions
+            f["Text8"] = digits[4]   # cell 5 — ten millions
+            # Text9 has 7 widget instances for cells 6-12 of item 26.
+            # Filling via the shared field name forces ALL cells to the same
+            # digit.  Store the 7 individual digits under a private key so
+            # SARReportFiler can inject them per-annotation instead.
+            f["_item26_text9_cells"] = digits[5:12]
+
+        # Filing date (MM/DD/YYYY standalone fields in AcroForm)
+        now = datetime.now()
+        f["MM"] = now.strftime("%m")
+        f["DD"] = now.strftime("%d")
+        f["YYYY"] = now.strftime("%Y")
 
         if self._as_bool(self.le.get("contacted", False)):
             f["92  LE contact agency"] = self.le.get("agency", "") or ""
@@ -645,127 +769,245 @@ class SARFieldMapper:
 
 
 class CTRFieldMapper:
-    """Map case JSON data to CTR PDF AcroForm field IDs."""
+    """
+    Map case JSON to FinCEN CTR Form 104 AcroForm field IDs.
 
-    # The CTR template in this repo has generic field IDs. These defaults are
-    # intentionally simple and can be overridden by providing case_data["ctr_field_map"].
-    DEFAULT_FIELD_MAP = {
-        "institution_name": "item-1",
-        "institution_ein": "item-2",
-        "institution_address": "item-3",
-        "institution_city_state": "item-4",
-        "conductor_name": "item-5",
-        "conductor_country": "item-6",
-        "total_cash_amount": "item-7",
-        "prepared_date": "item-8",
-        "contact_name": "text1",
-        "contact_phone": "text2",
-        "account_numbers": "text3",
-        "transaction_summary": "text4",
+    Field IDs verified against the live PDF template via diagnostic fill:
+      Section A: F1-1 (last name), F1-2 (first name), F1-3 (middle),
+                 F1-4 (DBA), F1-5 (SSN/EIN), F1-14 (address), item-4 (DOB),
+                 F1-18 (city), F1-19 (state), F1-21 (zip), F1-22 (country),
+                 F1-24 (occupation)
+      Section B: F1-28/30/31 (name), F1-32 (addr), F1-33 (SSN),
+                 f1-43 (city), f1-44 (state), f1-46 (zip), f1-47 (country),
+                 item-2 (DOB)
+      Part II:  text1 (cash in), text3 (cash out), item-3 (txn date),
+                f1-62..f1-67 (account numbers)
+      Part III: f1-68 (inst name), f1-69 (regulator code), f1-70 (addr),
+                f1-71 (EIN), f1-80 (city), f1-81 (state), f1-83 (zip),
+                f1-84 (routing/MICR)
+      Signature: f1-93 (title), f1-97 (preparer), f1-98 (contact),
+                 f1-99 (phone), f1-102 (alt preparer), f1-105 (date)
+    """
+
+    # Regulator code lookup per CTR Form 104 instructions (Item 37)
+    REGULATOR_CODES = {
+        "OCC": "1", "COMPTROLLER": "1",
+        "FDIC": "2",
+        "FRB": "3", "FEDERAL RESERVE": "3", "FRS": "3",
+        "OTS": "4",
+        "NCUA": "5",
+        "SEC": "6",
+        "IRS": "7",
+        "USPS": "8",
+        "CFTC": "9",
+        "STATE": "10",
     }
 
     def __init__(self, case_data: Dict):
         self.case = normalize_case_data(case_data)
         inst = self.case.get("institution", {})
         subject = self.case.get("subject", {})
-        activity = self.case.get("SuspiciousActivityInformation", {})
         self.inst = inst if isinstance(inst, dict) else {}
         self.subject = subject if isinstance(subject, dict) else {}
-        self.activity = activity if isinstance(activity, dict) else {}
         txns = self.case.get("transactions", [])
         self.txns = [tx for tx in txns if isinstance(tx, dict)] if isinstance(txns, list) else []
 
-        overrides = self.case.get("ctr_field_map", {})
-        if isinstance(overrides, dict):
-            self.field_map = {**self.DEFAULT_FIELD_MAP, **overrides}
-        else:
-            self.field_map = dict(self.DEFAULT_FIELD_MAP)
-
     def map_all_fields(self) -> Dict[str, str]:
         fields: Dict[str, str] = {}
+        fields.update(self._map_section_a())
         fields.update(self._map_institution())
-        fields.update(self._map_conductor())
         fields.update(self._map_transactions())
-        fields.update(self._map_contact())
+        fields.update(self._map_signature())
         return {
             key: str(value)
             for key, value in fields.items()
             if key and value is not None and value != ""
         }
 
-    def _put(self, out: Dict[str, str], logical_key: str, value: str) -> None:
-        field_id = self.field_map.get(logical_key)
-        if field_id and value not in ("", None):
-            out[field_id] = str(value)
+    # ------------------------------------------------------------------ #
+    # Part I Section A — Person on whose behalf transaction is conducted  #
+    # ------------------------------------------------------------------ #
+    def _map_section_a(self) -> Dict[str, str]:
+        f: Dict[str, str] = {}
+        full_name = (self.subject.get("name", "") or "").strip()
+        subject_type = (self.subject.get("type", "") or "").lower()
+        treat_as_entity = subject_type != "individual" or self._looks_like_entity_name(full_name)
 
+        if full_name and not treat_as_entity:
+            parts = full_name.split()
+            f["F1-1"] = parts[-1]                    # Item 2 — last name
+            f["F1-2"] = parts[0]                     # Item 3 — first name
+            if len(parts) >= 3:
+                f["F1-3"] = parts[1][0]              # Item 4 — middle initial
+        elif full_name:
+            f["F1-1"] = full_name                    # Item 2 — entity name
+
+        # Item 5 — DBA
+        dba = (self.subject.get("dba", "") or "").strip()
+        if dba:
+            f["F1-4"] = dba
+
+        # Item 6 — SSN or EIN
+        tin = (
+            self.subject.get("tin")
+            or self.subject.get("ssn")
+            or self.subject.get("ein")
+            or ""
+        )
+        if tin:
+            f["F1-5"] = str(tin).strip()
+
+        # Item 7 — Address  (F1-14 is the address field, confirmed by diagnostic)
+        addr = (self.subject.get("address", "") or "").strip()
+        if addr:
+            f["F1-14"] = addr
+
+        # Item 8 — Date of birth  (item-4 is the DOB field, confirmed by diagnostic)
+        dob = (self.subject.get("dob", "") or self.subject.get("date_of_birth", "") or "").strip()
+        if dob:
+            f["item-4"] = dob
+
+        # Items 9–11 — City / State / ZIP
+        city = (self.subject.get("city", "") or "").strip()
+        state = (self.subject.get("state", "") or "").strip()[:2]
+        zip_code = (self.subject.get("zip", "") or self.subject.get("postal_code", "") or "").strip()
+        if city:
+            f["F1-18"] = city
+        if state:
+            f["F1-19"] = state
+        if zip_code:
+            f["F1-21"] = zip_code
+
+        # Item 12 — Country code (only if non-US)
+        country = (self.subject.get("country", "") or "").strip().upper()[:2]
+        if country and country != "US":
+            f["F1-22"] = country
+
+        # Item 13 — Occupation / type of business
+        occ = (
+            self.subject.get("industry_or_occupation", "")
+            or self.subject.get("occupation", "")
+            or ""
+        ).strip()
+        if occ:
+            f["F1-24"] = occ
+
+        return f
+
+    # ------------------------------------------------------------------ #
+    # Part III — Financial institution where transaction takes place      #
+    # ------------------------------------------------------------------ #
     def _map_institution(self) -> Dict[str, str]:
         f: Dict[str, str] = {}
-        name = self.inst.get("name", "")
-        ein = self.inst.get("ein", "")
-        addr = self.inst.get("address", "")
-        city = self.inst.get("branch_city", "")
-        state = (self.inst.get("branch_state", "") or "")[:2]
-        city_state = f"{city}, {state}".strip(", ")
 
-        self._put(f, "institution_name", name)
-        self._put(f, "institution_ein", ein)
-        self._put(f, "institution_address", addr)
-        self._put(f, "institution_city_state", city_state)
+        name = (self.inst.get("name", "") or "BNY Mellon").strip()
+        ein = (self.inst.get("ein", "") or "13-4941247").strip()
+        addr = (self.inst.get("address", "") or "240 Greenwich Street").strip()
+        city = (self.inst.get("branch_city", "") or self.inst.get("city", "") or "New York").strip()
+        state = (self.inst.get("branch_state", "") or self.inst.get("state", "") or "NY").strip()[:2]
+        zip_code = (self.inst.get("zip", "") or self.inst.get("postal_code", "") or "10286").strip()
+        routing = (self.inst.get("routing_number", "") or self.inst.get("micr", "") or "021000018").strip()
+
+        f["f1-68"] = name       # Item 37 — Institution name
+        f["f1-70"] = addr       # Item 38 — Address
+        f["f1-71"] = ein        # Item 39 — EIN/SSN
+        f["f1-80"] = city       # Item 40 — City
+        f["f1-81"] = state      # Item 41 — State
+        f["f1-83"] = zip_code   # Item 42 — ZIP
+        f["f1-84"] = routing    # Item 43 — Routing (MICR)
+
+        # Item 37 regulator/BSA examiner code
+        regulator = (self.inst.get("primary_federal_regulator", "") or "FDIC").strip().upper()
+        code = self.REGULATOR_CODES.get(regulator, self.REGULATOR_CODES.get(regulator.split()[0], "2"))
+        f["f1-69"] = code
+
         return f
 
-    def _map_conductor(self) -> Dict[str, str]:
-        f: Dict[str, str] = {}
-        full_name = self.subject.get("name", "") or "Unknown"
-        country = self.subject.get("country", "US")
-        self._put(f, "conductor_name", full_name)
-        self._put(f, "conductor_country", country)
-        return f
-
+    # ------------------------------------------------------------------ #
+    # Part II — Amount and type of transaction(s)                         #
+    # ------------------------------------------------------------------ #
     def _map_transactions(self) -> Dict[str, str]:
         f: Dict[str, str] = {}
-        total_cash = calculate_total_cash_amount(self.case)
-        if total_cash:
-            self._put(f, "total_cash_amount", f"{total_cash:,.2f}")
 
-        accounts = []
-        seen = set()
+        # Item 28 — Date of transaction  (item-3, confirmed by diagnostic)
+        if self.txns:
+            ts = (self.txns[0].get("timestamp", "") or self.txns[0].get("date", "") or "").strip()
+            if ts:
+                date_part = ts.split("T")[0] if "T" in ts else ts
+                f["item-3"] = date_part
+
+        # Items 26 / 27 — Cash in / cash out
+        # text1 = total cash in (Item 26), text3 = total cash out (Item 27)
+        cash_in = 0.0
+        cash_out = 0.0
         for tx in self.txns:
-            for key in ("origin_account", "destination_account"):
-                value = tx.get(key, "")
-                if value and value not in seen:
-                    seen.add(value)
-                    accounts.append(value)
-        if accounts:
-            self._put(f, "account_numbers", ", ".join(accounts[:4]))
+            amt = float(tx.get("amount_usd", 0) or tx.get("amount", 0) or 0)
+            tx_type = (tx.get("type", "") or tx.get("transaction_type", "") or "").lower()
+            if "out" in tx_type or "withdraw" in tx_type:
+                cash_out += amt
+            else:
+                cash_in += amt
 
-        tx_lines: List[str] = []
-        for tx in self.txns[:6]:
-            ts = tx.get("timestamp", "")
-            amt = float(tx.get("amount_usd", 0) or 0)
-            instrument = tx.get("instrument_type", "")
-            product = tx.get("product_type", "")
-            tx_lines.append(f"{ts} ${amt:,.2f} {instrument} {product}".strip())
-        if tx_lines:
-            self._put(f, "transaction_summary", " | ".join(tx_lines)[:500])
+        total_cash = calculate_total_cash_amount(self.case)
+        if cash_in > 0:
+            f["text1"] = f"{cash_in:,.2f}"
+        elif total_cash > 0:
+            f["text1"] = f"{total_cash:,.2f}"
+
+        if cash_out > 0:
+            f["text3"] = f"{cash_out:,.2f}"      # text3 = cash out (NOT text4!)
+
+        # Item 35 — Account numbers (f1-62 through f1-67, confirmed by diagnostic)
+        accounts: List[str] = []
+        seen: set = set()
+        for tx in self.txns:
+            for key in ("origin_account", "destination_account", "account_number"):
+                val = (tx.get(key, "") or "").strip()
+                if val and val not in seen:
+                    seen.add(val)
+                    accounts.append(val)
+        acct_fields = ["f1-62", "f1-63", "f1-64", "f1-66", "f1-67"]
+        for idx, acct in enumerate(accounts[:5]):
+            f[acct_fields[idx]] = acct
 
         return f
 
-    def _map_contact(self) -> Dict[str, str]:
+    # ------------------------------------------------------------------ #
+    # Signature / preparer section                                        #
+    # ------------------------------------------------------------------ #
+    def _map_signature(self) -> Dict[str, str]:
         f: Dict[str, str] = {}
-        contact_name = self.inst.get("contact_officer", "")
-        if contact_name:
-            self._put(f, "contact_name", contact_name)
 
-        phone = self.inst.get("contact_phone", "") or ""
+        contact_name = (self.inst.get("contact_officer", "") or "Compliance Officer").strip()
+        phone = (self.inst.get("contact_phone", "") or "2125956009").strip()
+
+        # Item 44 — Title of approving official (hardcoded; static per institution)
+        f["f1-93"] = "Chief Compliance Officer"
+
+        # Item 47 — Preparer's name  (f1-97, confirmed by diagnostic)
+        f["f1-97"] = contact_name
+
+        # Item 48 — Contact person  (f1-98, confirmed by diagnostic)
+        f["f1-98"] = contact_name
+
+        # Item 49 — Telephone  (f1-99, confirmed by diagnostic)
         digits = re.sub(r"\D", "", phone)
         if len(digits) == 11 and digits.startswith("1"):
             digits = digits[1:]
-        if len(digits) >= 10:
-            self._put(f, "contact_phone", f"{digits[:3]}-{digits[3:10]}")
+        if digits:
+            f["f1-99"] = digits[:10]
 
-        now = datetime.now().strftime("%m/%d/%Y")
-        self._put(f, "prepared_date", now)
+        # Filing date
+        now = datetime.now()
+        f["f1-105"] = now.strftime("%m/%d/%Y")
+
         return f
+
+    @staticmethod
+    def _looks_like_entity_name(name: str) -> bool:
+        upper = f" {(name or '').upper()} "
+        entity_tokens = (" LLC ", " INC ", " CORP ", " CORPORATION ", " LTD ", " COMPANY ", " CO. ")
+        return any(token in upper for token in entity_tokens)
 
 
 def _to_list(value) -> List[str]:

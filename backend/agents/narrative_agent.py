@@ -17,7 +17,11 @@ class NarrativeKnowledgeBaseError(RuntimeError):
     """Raised when narrative guidance cannot be loaded from Supabase."""
 
 
-def _validate_input(data: Dict[str, Any]) -> Dict[str, Any]:
+def _validate_input(data: Dict[str, Any], report_type_code: str = "SAR") -> Dict[str, Any]:
+    # OFAC rejection reports use a different payload structure — they don't have
+    # SuspiciousActivityInformation or a standard case_id/subject layout.
+    if report_type_code.upper() == "OFAC_REJECT":
+        return data
     required = {"case_id", "subject", "SuspiciousActivityInformation"}
     missing = required - set(data.keys())
     if missing:
@@ -216,8 +220,8 @@ def generate_narrative_payload(
         "regulations_cited": [...]
       }
     """
-    _validate_input(input_data)
     report_code = (report_type_code or "SAR").upper()
+    _validate_input(input_data, report_type_code=report_code)
 
     llm = LLM(
         model="openai/gpt-4o-mini",
@@ -225,13 +229,29 @@ def generate_narrative_payload(
         max_tokens=2200,
         api_key=settings.OPENAI_API_KEY,
     )
-    agent = Agent(
-        role="SAR Narrative Writer",
-        goal="Write accurate, factual narratives using only the provided suspicious activity data.",
-        backstory=(
+    if report_code == "OFAC_REJECT":
+        agent_role = "OFAC Rejection Report Narrative Writer"
+        agent_goal = (
+            "Write accurate, factual narratives for OFAC sanctions rejection reports "
+            "using only the provided transaction and sanctions data."
+        )
+        agent_backstory = (
+            "You are a compliance analyst drafting OFAC rejection report narratives. "
+            "You describe the rejected wire transfer, the sanctioned party, the sanctions "
+            "program invoked, and the disposition — using only facts from the input JSON. "
+            "You never invent names, amounts, dates, or events not explicitly provided."
+        )
+    else:
+        agent_role = "SAR Narrative Writer"
+        agent_goal = "Write accurate, factual narratives using only the provided suspicious activity data."
+        agent_backstory = (
             "You are a compliance analyst drafting SAR narratives. You never invent "
             "names, dates, amounts, accounts, or events not explicitly provided."
-        ),
+        )
+    agent = Agent(
+        role=agent_role,
+        goal=agent_goal,
+        backstory=agent_backstory,
         llm=llm,
         verbose=verbose,
         allow_delegation=False,
